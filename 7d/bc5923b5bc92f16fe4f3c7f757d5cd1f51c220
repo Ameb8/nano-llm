@@ -1,0 +1,19 @@
+README.md
+  s_7657c3525956a3::t_0d82f645c10e5b 1-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.4.12",
+  "base_commit_sha": "7dbc5923b5bc92f16fe4f3c7f757d5cd1f51c220",
+  "prompts": {},
+  "sessions": {
+    "s_7657c3525956a3": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a04721-a566-755b-af33-63a2af462f7d",
+        "model": "vx-gemini-3.7-f"
+      },
+      "human_author": "Alex Buckley <alexmeb81@outlook.com>"
+    }
+  }
+}

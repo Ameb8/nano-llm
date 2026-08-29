@@ -1,41 +1,64 @@
-# RALLM — Rust LLM Gateway
+# nano-llm — Rust LLM Gateway
 
 **Spec v0.1**
 
-A single-binary, config-driven LLM routing gateway in Rust. LiteLLM-config-compatible
-for the subset of features that matter: model list, provider params, and fallback
-chains. No database, no built-in dashboard, no enterprise gate. Config is YAML,
-loaded at startup, hot-reloadable via SIGHUP (stretch goal).
+A single-binary, config-driven LLM routing gateway in Rust. Its configuration is
+LiteLLM-shaped for the documented subset that matters: model lists, provider
+parameters, and fallback chains. This is migration familiarity, not a claim that
+arbitrary LiteLLM configurations are compatible. No database, no built-in
+dashboard, no enterprise gate. Config is YAML, loaded at startup. Hot reload via
+SIGHUP is not part of v0.1; configuration is immutable for the process lifetime.
+
+The primary user is a single operator or small trusted team that wants a
+self-hosted reliability shim across a handful of LLM providers. nano-llm is not
+an organization-wide AI platform: it favors one process, one config file, one
+shared inbound key, static operator-defined routing, and troubleshooting-oriented
+logs over multi-user administration, dynamic policy systems, metering, or
+analytics. It should remain comfortable to run on a laptop, Raspberry Pi, small
+VM, or minimal container.
 
 ---
 
 ## 1. Goals / Non-Goals
 
 ### Goals
-- Drop-in-*shaped* config: a `model_list` + `general_settings` YAML file, close enough
-  to LiteLLM's schema that porting an existing config is a find/replace job, not a rewrite.
+- Familiar migration path: a `model_list` + `general_settings` YAML file using
+  recognizable LiteLLM names, but governed by nano-llm's own strict, documented
+  schema. Existing LiteLLM configs may require small edits and removal of
+  unsupported fields before they validate.
 - Real transparent failover: client sends one request, gateway tries target 1, on
-  failure (timeout, 5xx, 429, connection error) transparently retries against target 2,
+  failure (timeout, 5xx, 429, connection error) transparently advances to target 2,
   3, etc. Client never sees the first failure unless *all* targets are exhausted.
-- Streaming (SSE) support end-to-end, including failover *before* the first byte
-  of a streamed response has been sent to the client. (Once bytes have started
-  streaming to the client, failover is no longer possible — see §6.4.)
-- One inbound API surface: OpenAI-compatible `/v1/chat/completions`,
-  `/v1/completions`, `/v1/embeddings`. Clients speak OpenAI's wire format
+- Streaming (SSE) support end-to-end, including failover *before* a streamed
+  response has been committed to the client. Once a canonical SSE chunk has
+  been sent, failover is no longer possible — see §4.
+- One inbound generation surface: an OpenAI-compatible
+  `/v1/chat/completions`. Clients use the same documented v0.1 wire format
   regardless of which upstream provider actually serves the request.
-- Provider support: OpenAI, Anthropic, Gemini (both Generative Language API and
-  Vertex AI), Mistral, DeepSeek.
+- Provider support: OpenAI, Anthropic, Gemini Generative Language API, Mistral,
+  DeepSeek, and custom OpenAI-compatible endpoints.
 - Minimal footprint: target <20MB idle RSS, single static binary, no runtime deps.
 - Simple bearer-token auth on the gateway's own inbound endpoint (`master_key`).
 
 ### Non-goals (explicitly out of scope for v0.1)
-- Circuit breaker / adaptive health tracking across requests (per your instruction —
-  retry/failover is per-request only; no cross-request cooldown state).
+- Circuit breaker / adaptive health tracking across requests (failover is
+  per-request only; no cross-request cooldown state). Consequently, every
+  request probes the primary even during an outage and may pay its configured
+  timeout before falling back.
 - Budgets, spend tracking, per-key rate limiting, usage dashboards.
 - Semantic caching, prompt guardrails, PII redaction.
-- MCP gateway, agent tooling, tool-call translation beyond passthrough.
+- Legacy `/v1/completions` and `/v1/embeddings` endpoints.
+- Multimodal content, structured/JSON-schema output, log probabilities, and
+  provider-specific request extensions. These must be rejected clearly in
+  v0.1, including when the selected upstream could accept them, so every
+  configured fallback target has the same interface.
+- MCP gateway and agent tooling.
+- Vertex AI and its GCP authentication stack. It is the first planned
+  post-v0.1 provider and will reuse the v0.1 Gemini translation layer.
 - Multi-tenant virtual keys / RBAC. One `master_key`, that's it.
 - A web UI. Config is the UI.
+- Inbound TLS termination, certificate management, and ACME. Remote deployments
+  terminate TLS in a reverse proxy, tunnel, or load balancer.
 
 ---
 
@@ -48,12 +71,9 @@ model_list:
   - model_name: <string>          # the name clients request
     litellm_params:
       model: <provider>/<upstream-model-id>
-      api_key: os.environ/<VAR>   # or literal string (discouraged)
+      api_key: os.environ/<VAR>   # env reference required when key is present
       api_base: <string>          # optional override, e.g. self-hosted/proxy endpoints
-      vertex_location: <string>   # vertex_ai only
-      vertex_credentials: os.environ/<VAR>  # vertex_ai only; path to service-account JSON
       timeout: <seconds>          # optional, per-target override
-      # ... provider-specific passthrough params (temperature defaults, etc.) — v0.2
 
   - model_name: <string>          # SAME model_name reused = additional fallback target
     litellm_params:
@@ -62,24 +82,16 @@ model_list:
 general_settings:
   master_key: os.environ/<VAR>
   request_timeout: <seconds>      # global default, per-target override wins
-  max_retries: <int>               # global default retry count per target before
-                                    # moving to next fallback target (default: 1, i.e.
-                                    # no retry, just fail to next target)
+  overall_timeout: <seconds>      # whole fallback chain; default 120 seconds
+  max_in_flight: <int>            # process-wide request cap; default 64
 ```
 
 ### 2.2 Key design decision: how fallback groups are formed
 
-LiteLLM's real schema uses a separate `fallbacks:` block mapping model name →
-ordered list of other model names. Reusing the **same `model_name` across multiple
-`model_list` entries** (as shown in your example — `vx-gemini-3.7-f` appearing
-once is fine, but note `mistral-fast` and `codestrol-latest` are *different*
-model names, i.e. not fallback groups of each other) is visually clean but
-ambiguous: does the client ask for `"model": "mistral-fast"` and expect it to
-silently fall back to `codestrol-latest`? Not unless they share a `model_name`.
-
-**Decision for v0.1:** support *both*, because your pasted example implies the
-first (implicit grouping by repeated `model_name`) but LiteLLM's actual docs use
-the second (explicit `fallbacks:`). Concretely:
+v0.1 has one routing mechanism: entries that repeat the same `model_name` form
+one fixed-priority fallback route. Every request begins at the first entry;
+later entries are attempted only after earlier failures. File order is attempt
+order. A name with one entry has no fallback.
 
 ```yaml
 model_list:
@@ -90,23 +102,19 @@ model_list:
 
   - model_name: default          # same model_name → 2nd target in same group
     litellm_params:
-      model: vertex_ai/gemini-3.7-flash
-      vertex_location: "global"
-      vertex_credentials: os.environ/VERTEX_CREDENTIALS_PATH
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
-  # optional explicit fallback cross-references, for when you want
-  # DIFFERENT model_names to fall back into each other:
-  fallbacks:
-    - mistral-fast: [vx-gemini-3.7-f, vx-gemini-3.6-f]
 ```
 
-Rule: entries sharing a `model_name` are merged into one ordered target list
-(order = file order). `general_settings.fallbacks` additionally appends targets
-from *other* model_names onto a group, for cross-group fallback chains. Both are
-optional; a `model_name` with a single entry and no `fallbacks` reference simply
-has no failover — it either succeeds or returns an error.
+There are no cross-group references in v0.1. This makes every route locally
+visible and avoids graph expansion, cycle detection, and deduplication rules.
+Operators who want the same concrete target in multiple routes repeat its
+configuration under each public `model_name`. Repeated entries do not
+load-balance successful traffic: v0.1 has no round-robin, random, weighted,
+latency-based, or cost-based target selection.
 
 ### 2.3 `os.environ/VAR` resolution
 
@@ -115,32 +123,66 @@ process environment at config-load time. Missing env var → fail fast at startu
 with a clear error naming the config path and var name. No silent empty-string
 fallback.
 
+Secret fields do not accept literal values in v0.1. `master_key` and every
+present `api_key` must use the exact `os.environ/VAR_NAME` form; inline secrets
+are config errors. The generic `openai_compatible/` adapter may omit `api_key`
+entirely as described below.
+
+Secret values are treated specially. `master_key`, provider API keys,
+authorization headers, and access tokens are never printed or logged. The
+`--validate` output shows the resolved routing table with all secret values
+replaced by `[REDACTED]`.
+
+`api_base` means a versioned provider base URL, not a complete operation URL.
+For example, `https://example.test/v1` is valid for an OpenAI-compatible
+provider; the adapter appends `/chat/completions`. The Gemini adapter likewise
+appends its documented model and operation paths. A trailing slash is accepted
+and normalized away.
+
 ### 2.4 Provider identification
 
 The prefix before `/` in `litellm_params.model` selects the provider adapter:
 
-| Prefix        | Provider                          | Wire format required          |
-|---------------|------------------------------------|-------------------------------|
-| `openai/`     | OpenAI                             | native (passthrough)          |
-| `anthropic/`  | Anthropic                          | translate                     |
-| `mistral/`    | Mistral                            | native (OpenAI-compatible)    |
-| `deepseek/`   | DeepSeek                           | native (OpenAI-compatible)    |
-| `gemini/`     | Google Generative Language API     | translate                     |
-| `vertex_ai/`  | Google Vertex AI (Gemini via GCP)  | translate + GCP auth          |
+| Prefix               | Provider/preset                    | Adapter family                |
+|----------------------|------------------------------------|-------------------------------|
+| `openai/`            | OpenAI                             | OpenAI-compatible             |
+| `mistral/`           | Mistral                            | OpenAI-compatible             |
+| `deepseek/`          | DeepSeek                           | OpenAI-compatible             |
+| `openai_compatible/` | Custom compatible endpoint         | OpenAI-compatible             |
+| `anthropic/`         | Anthropic                          | Anthropic translation         |
+| `gemini/`            | Google Generative Language API     | Gemini translation            |
 
 Everything after the first `/` is passed through verbatim as the upstream
 `model` field (or path component, for providers that put it in the URL).
+Provider-specific prefixes are thin presets, not independent adapter
+implementations. `openai/`, `mistral/`, and `deepseek/` select the same
+OpenAI-compatible adapter and differ only in defaults such as `api_base`.
+`openai_compatible/` selects that adapter without branded defaults and therefore
+requires an explicit `api_base`. Its `api_key` is optional: when present the
+adapter sends it as a bearer token, and when absent it sends no authorization
+header. This supports local and trusted-network endpoints without dummy keys.
 
 ### 2.5 Validation at load time
 
 - Every `model_list` entry must have `model_name` and `litellm_params.model`.
+- `model_name` is case-sensitive, 1–128 characters, and must match
+  `[A-Za-z0-9][A-Za-z0-9._:/-]*`.
 - `litellm_params.model` must have a recognized provider prefix.
-- `vertex_ai/*` entries must have `vertex_location` and `vertex_credentials`.
+- Branded provider prefixes require `api_key`. `openai_compatible/` may omit it.
+- `request_timeout` and per-target `timeout` values must be positive. The
+  default is 30 seconds.
+- `overall_timeout` must be positive and defaults to 120 seconds.
+- `max_in_flight` must be positive and defaults to 64.
 - All `os.environ/*` references must resolve.
+- `master_key` and every present `api_key` must be environment references, not
+  inline literals.
 - `general_settings.master_key` is required unless `--no-auth` flag is passed
   explicitly (for local dev only — should warn loudly on startup if unset).
 - Config errors are fatal at startup, not runtime. Never start serving with a
   broken model group silently dropped.
+- Unknown top-level, `general_settings`, and `litellm_params` keys are config
+  errors in v0.1. This gateway implements a documented LiteLLM-shaped subset;
+  it must not silently accept settings that it does not honor.
 
 ---
 
@@ -150,11 +192,11 @@ Everything after the first `/` is passed through verbatim as the upstream
                     ┌─────────────────────────────────┐
                     │        HTTP Server (axum)        │
                     │  /v1/chat/completions            │
-                    │  /v1/completions                 │
-                    │  /v1/embeddings                  │
+                    │  /v1/models                      │
                     │  /health                          │
                     └────────────────┬──────────────────┘
-                                     │  bearer auth check (master_key)
+                                     │  bearer auth check on /v1/*
+                                     │  (/health bypasses auth)
                                      ▼
                     ┌─────────────────────────────────┐
                     │           Router                 │
@@ -170,7 +212,7 @@ Everything after the first `/` is passed through verbatim as the upstream
               │ (target1) │   │ (target2) │   │ (target3) │
               └─────┬─────┘   └───────────┘   └───────────┘
                     │  translate request → send → on error, return
-                    │  Err(RetryableError) to Router, which advances
+                    │  structured TargetError; Router advances
                     │  to next target
                     ▼
               upstream provider API
@@ -179,30 +221,26 @@ Everything after the first `/` is passed through verbatim as the upstream
 ### 3.1 Crate layout (suggested)
 
 ```
-rallm/
+nano-llm/
   Cargo.toml
   src/
     main.rs              # CLI entry, config load, server bootstrap
     config/
       mod.rs              # schema structs (serde), validation
       env_resolve.rs       # os.environ/VAR resolution
-      fallback_groups.rs   # merge model_list entries into target lists
+      routes.rs            # merge repeated model_name entries in file order
     server/
       mod.rs               # axum router setup
       auth.rs              # bearer token middleware
       handlers.rs          # /v1/chat/completions etc — thin, delegates to router
     router/
       mod.rs               # core dispatch loop: try target[i], on fail advance
-      retry.rs             # retry policy (max_retries per target, backoff)
-      error.rs             # RetryableError vs FatalError classification
+      error.rs             # structured target-attempt failures
     providers/
       mod.rs               # Provider trait
-      openai.rs
-      anthropic.rs
-      gemini.rs             # Generative Language API
-      vertex.rs             # Vertex AI (Gemini via GCP, separate auth path)
-      mistral.rs
-      deepseek.rs
+      openai_compatible.rs  # OpenAI wire family + branded endpoint presets
+      anthropic.rs          # Anthropic wire family
+      gemini.rs             # Gemini wire translation + API-key transport
     translate/
       mod.rs
       openai_wire.rs        # canonical request/response types (OpenAI shape)
@@ -212,71 +250,198 @@ rallm/
       mod.rs                # SSE passthrough + re-framing helpers
 ```
 
-### 3.2 The `Provider` trait
+### 3.2 Canonical chat interface and the provider seam
+
+The gateway owns a strict canonical v0.1 chat shape. It parses and validates an
+inbound request once, before routing, then passes the same immutable canonical
+request to every target. This prevents adapters from interpreting the client
+request differently and makes the provider interface the router's test surface.
+
+Supported request fields are:
+
+| Field | v0.1 behavior |
+|-------|---------------|
+| `model` | Required; selects a configured model group. |
+| `messages` | Required; ordered canonical messages. Supports leading text `system` and `developer` instructions, text `user` and `assistant` messages, assistant tool calls, and text `tool` results linked by tool-call ID. |
+| `stream` | Optional boolean; defaults to `false`. |
+| `stream_options` | Optional only when streaming; the sole supported member is boolean `include_usage`. |
+| `max_tokens` | Optional positive integer. Omission is preserved; the gateway does not invent a default. |
+| `max_completion_tokens` | Optional alias for `max_tokens`. Supplying both fields is a 400 validation error. |
+| `temperature` | Optional number from 0 through 1, the portable range across v0.1 providers. |
+| `top_p` | Optional number from 0 through 1. |
+| `stop` | Optional string or list of up to four nonempty strings, each at most 256 UTF-8 bytes. A single string is normalized to a one-element list. |
+| `tools` | Optional OpenAI-shaped function-tool definitions. The portable v0.1 subset is translated by every adapter. |
+| `tool_choice` | Optional; supports `auto` (default when tools are present), `none`, `required`, or one specifically named function in OpenAI's object form. |
+
+All other request fields are rejected with an OpenAI-shaped 400 error naming
+the unsupported field. In particular, v0.1 does not silently discard
+multimodal parts, response schemas, provider-specific extensions, or unknown
+fields. This is deliberately narrower than the full OpenAI interface.
+
+`system` and `developer` messages are accepted only as a leading instruction
+prefix before the first `user`, `assistant`, or `tool` message. Their order is
+preserved and adapters combine them into the provider's system-instruction
+representation. Either role appearing after the conversation begins is a 400
+validation error. `developer` is an inbound compatibility role, not a distinct
+provider capability.
+
+Tool calling is part of the canonical interface rather than a provider-specific
+extension. Tool definitions use the OpenAI function-tool shape; assistant tool
+calls and tool-result messages are normalized into the same shape across
+providers. A route is valid only if every adapter family used by it implements
+this canonical tool contract. Responses may contain multiple tool calls, and
+streaming adapters must preserve their indices while assembling argument
+deltas. The `parallel_tool_calls` request field is rejected in v0.1: nano-llm
+can represent multiple calls emitted by a provider but does not promise portable
+control over whether providers generate them in parallel.
+
+The gateway structurally validates each tool definition: `type` must be
+`function`, the function name must match `[A-Za-z0-9_-]{1,64}` and be unique
+within the request, and
+`parameters` must be a JSON object when present. The contents of `parameters`
+are otherwise treated as opaque JSON Schema and preserved while the surrounding
+provider wire format is translated. nano-llm does not implement its own JSON
+Schema validator, restrict schemas to a gateway-defined keyword subset, resolve
+`$ref`, or rewrite schemas for provider compatibility in v0.1. Advanced-schema
+portability across fallback targets is therefore best effort; a provider schema
+rejection is a `TargetError` and advances to the next route entry.
+
+Tool-call history is validated as a portable state machine. Every assistant
+tool call must have a nonempty ID unique within the request and must name a tool
+declared by the current request. A following `tool` message must reference an
+unresolved call from that immediately preceding assistant tool-call turn. Each
+call receives exactly one result, multiple results may arrive in any order, and
+all calls must be resolved before another `user` or `assistant` turn begins.
+Violations are gateway validation errors and return 400 before routing.
+
+`function.arguments` remains an opaque string in the canonical message and
+response types. OpenAI-compatible adapters preserve it unchanged, even when it
+is not valid JSON. Adapters such as Anthropic and Gemini parse the string only
+when their native wire format requires an argument object; failure to parse is
+a `TargetError` for that target and advances the route. nano-llm does not reject
+an otherwise well-formed OpenAI-compatible response solely because a model
+emitted malformed JSON arguments.
+
+The canonical non-streaming response contains `id`, `object`, `created`,
+`model`, `choices`, and `usage` when the upstream reports usage. Each choice
+contains `index`, an assistant message with text content and/or normalized tool
+calls, and a normalized `finish_reason`. Streaming produces OpenAI-shaped chat
+completion chunks with role, content, and tool-call deltas, a final finish
+reason, and exactly one `data: [DONE]` on a successful stream. When
+`stream_options.include_usage` is true, emit a final canonical usage chunk if
+the selected provider reports streaming usage; otherwise finish normally
+without estimating or inventing usage. Other `stream_options` members are
+rejected. The response
+`model` is always the client-requested model group, not the concrete fallback
+target; the selected provider and upstream model are recorded in structured
+logs.
+
+Final finish reasons are normalized to four OpenAI-shaped values: normal end or
+stop-sequence completion becomes `stop`, an output limit becomes `length`, tool
+invocation becomes `tool_calls`, and a safety/policy block becomes
+`content_filter`. An unknown terminal reason on an otherwise well-formed 2xx
+response becomes `stop`; the safe upstream reason is logged at debug level and
+does not trigger fallback.
+
+The adapter for a configured target satisfies this interface:
 
 ```rust
 #[async_trait]
 trait Provider: Send + Sync {
-    /// Non-streaming call. Takes the canonical (OpenAI-shape) request,
-    /// returns canonical response or a classified error.
-    async fn complete(&self, req: &CanonicalRequest) -> Result<CanonicalResponse, ProviderError>;
+    async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, TargetError>;
 
-    /// Streaming call. Returns a stream of canonical SSE chunks.
-    async fn complete_stream(&self, req: &CanonicalRequest)
-        -> Result<BoxStream<'static, Result<CanonicalChunk, ProviderError>>, ProviderError>;
+    async fn complete_stream(&self, req: &ChatRequest)
+        -> Result<BoxStream<'static, Result<ChatChunk, TargetError>>, TargetError>;
 }
 ```
 
-Every provider adapter implements this against **one canonical internal
-request/response shape** (OpenAI's, since 3 of 5 providers are already
-OpenAI-wire-compatible and clients speak OpenAI anyway). Anthropic and
-Gemini/Vertex adapters do request translation in, response translation out.
-Mistral, DeepSeek, and OpenAI itself are near-passthrough (base URL + auth
-header swap, maybe minor field renames).
+Each adapter is constructed with one target's validated configuration, so the
+router does not need to understand provider URLs, authentication, or wire
+formats. Anthropic and Gemini adapters translate at this seam. Mistral,
+DeepSeek, and OpenAI are near-passthrough adapters, but still validate and
+normalize responses through the same interface.
 
-### 3.3 `ProviderError` classification
+### 3.3 Target errors and the public failure contract
 
-This is the crux of correct failover: every error a provider adapter can
-produce needs to be tagged retryable or not.
+Canonical request validation happens before routing. Once routing begins, every
+provider failure has the same control-flow result: record the failure and
+advance to the next route entry. Error kinds exist for diagnostics, not to
+create separate routing policies.
 
 ```rust
-enum ProviderError {
-    Retryable(RetryableKind),
-    Fatal(String),   // e.g. malformed request — retrying won't help, but
-                      // *should* still advance to next target in case it's a
-                      // provider-specific quirk, not a genuinely bad request
+struct TargetError {
+    kind: TargetErrorKind,
+    upstream_status: Option<u16>,
+    safe_message: String,
 }
 
-enum RetryableKind {
+enum TargetErrorKind {
     Timeout,
     ConnectionError,
-    RateLimited { retry_after: Option<Duration> },
-    ServerError(u16),      // 5xx
-    Overloaded,             // Anthropic's 529, etc.
+    RateLimited,
+    Authentication,
+    PermissionDenied,
+    RejectedRequest,
+    InvalidResponse,
+    Overloaded,
+    UpstreamHttp,
 }
 ```
 
-**Decision:** treat *all* upstream errors as advance-to-next-target, including
-"fatal" ones — the only thing that should stop the fallback walk early is
-exhausting the target list. A 400 from provider A might be a 200 from provider
-B if the request happens to hit a provider-specific validation quirk (e.g. a
-param name mismatch after translation). This is simpler than trying to
-perfectly classify every error and matches "transparent failover" as you
-described it. Rate-limit `retry_after` is honored only for same-target retries
-within `max_retries`, not for the cross-target advance (advancing is immediate).
+Connection failures, timeouts, upstream 3xx/4xx/5xx responses, authentication
+failures, provider rejections, overload responses, malformed bodies, and stream
+setup failures all become `TargetError`. The router logs each kind safely and
+advances. Adapters must not include secrets or raw upstream response bodies in
+`safe_message`.
 
-### 3.4 Retry vs Fallback — two distinct knobs
+Any well-formed successful provider response ends routing. The gateway does not
+fall back because of a safety refusal, content-filter finish reason,
+length-limited output, empty text accompanied by valid tool calls, or a model's
+natural-language refusal. nano-llm evaluates protocol success, not semantic
+quality or policy outcomes.
 
-- **Retry**: same target, same provider, up to `max_retries` times (config:
-  `general_settings.max_retries`, default 1 = no retry). Use for transient
-  network blips. Respects `Retry-After` header if present, capped at some
-  sane max wait (e.g. 5s) so a single request doesn't hang the client forever.
-- **Fallback**: advance to the *next target* in the group's ordered list.
-  Always happens after retries for the current target are exhausted. No
-  configurable limit beyond "list is exhausted."
+The upstream HTTP client must not follow redirects. Any 3xx response becomes a
+`TargetError` so bearer tokens and query-string API keys cannot be forwarded to
+an unexpected host. Configured base URLs must point directly at the intended API
+endpoint family.
 
-Total attempts for a request = sum of `max_retries` across all targets in the
-group.
+The gateway owns the client-visible error contract. Gateway validation errors
+return 400, a request body larger than 1 MiB returns 413, an unknown requested
+model returns 404, process-wide concurrency exhaustion returns 503, and
+expiration of `overall_timeout` returns 504. If every route entry fails before
+that deadline, return an OpenAI-shaped 502 error with a stable gateway message.
+Do not expose the final provider's status merely because it happened to be last,
+and do not name provider credentials or include raw upstream bodies in the
+response.
+
+### 3.4 One attempt per route entry
+
+The router attempts each route entry at most once and advances immediately on
+any `TargetError`. Gateway request validation happens before this loop. There is
+no implicit same-target retry, backoff, jitter, or `Retry-After` scheduling.
+Operators who intentionally want another attempt against the same target repeat
+that target as another entry in the route. This keeps attempt count and order
+visible in configuration.
+
+The maximum number of upstream attempts is therefore the number of entries in
+the route, subject to the whole-request deadline.
+
+`request_timeout` defaults to 30 seconds and may be overridden per target with
+`litellm_params.timeout`. For non-streaming calls it limits one complete
+upstream attempt. For streaming calls it first limits connection plus time to
+the first canonical chunk; after commitment, it becomes an idle timeout that
+resets after every canonical chunk. A committed stream that exceeds this idle
+timeout is closed without fallback. `overall_timeout` defaults to 120 seconds
+and covers the fallback chain only until a response is committed. Each
+pre-commit attempt is clipped to the time remaining in that overall deadline.
+There is no total generation-duration timeout for a stream that continues
+making progress.
+
+The gateway cancels the active upstream request when the downstream client
+disconnects and does not continue falling back. Fallback can cause more than one
+provider to begin a billable generation when a connection fails after the
+upstream accepted a request. v0.1 does not promise cross-provider
+deduplication.
 
 ---
 
@@ -286,52 +451,63 @@ This is the sharpest edge in the whole design, worth calling out explicitly.
 
 ### 4.1 Rule
 
-**Failover is only possible before the first byte has been forwarded to the
-client.** Once the gateway has started writing SSE chunks downstream, it has
-committed to that upstream — a mid-stream provider failure becomes a stream
-termination (with an SSE `error` event or an abrupt close), not a silent
-retry, because:
+**Failover is only possible before the first canonical SSE chunk and downstream
+response headers have been sent to the client.** Once the response is
+committed, a mid-stream provider failure terminates the stream; it never causes
+a silent retry, because:
 - The client may have already rendered/acted on partial tokens.
 - Re-issuing the same prompt against a different provider mid-stream would
   either duplicate content or produce an incoherent transcript.
 
 ### 4.2 Implementation approach
 
-The gateway buffers the **first chunk** from the upstream stream before
-forwarding anything to the client. This costs one chunk of latency (typically
-tens of ms) but means:
+The gateway obtains and validates the **first canonical chunk** from the
+upstream stream before constructing the downstream streaming response. This
+ensures axum has not sent a 200 status or SSE headers while failover is still
+possible. It costs one chunk of latency but means:
 - If target 1's stream fails/errors before yielding any chunk (including an
   immediate 4xx/5xx on the streaming request itself), the gateway can still
   transparently advance to target 2 — client never knows target 1 was tried.
-- Once the first chunk is received and forwarded, the gateway is "locked in"
-  to that upstream for the rest of the request.
+- SSE comments, provider keepalives, and empty frames are ignored and do not
+  count as the first canonical chunk. A valid role-only OpenAI chunk does count.
+- Once the first canonical chunk and response headers are sent, the gateway is
+  "locked in" to that upstream for the rest of the request.
 
 ```
 connect to target[i] (streaming)
-  ├─ error before first chunk? → advance to target[i+1], retry loop
-  └─ first chunk received?
+  ├─ error before first canonical chunk? → classify, stop, or fall back
+  └─ first canonical chunk validated?
        → forward it, then pipe remaining chunks directly (locked in)
-       → upstream fails mid-stream? → emit SSE error event, close. Do NOT
-         advance to target[i+1].
+       → upstream fails or emits malformed data? → close the stream. Do NOT
+         emit a nonstandard error event or advance to target[i+1].
 ```
+
+The streaming adapter normalizes provider termination into exactly one OpenAI
+`data: [DONE]` event. If the provider ends without a valid terminal event, the
+gateway closes the stream without inventing `[DONE]`. A downstream disconnect
+cancels the upstream stream immediately. Each decoded upstream SSE event is
+limited to 1 MiB. Exceeding the limit before commitment is a `TargetError` and
+may fall back; after commitment it closes the stream. Total stream bytes are not
+capped because the response is processed incrementally.
 
 ### 4.3 Non-streaming requests
 
-No such constraint — buffer the full response, and if the upstream call
-fails at any point (including a failure while reading the body), advance to
-the next target normally.
+The gateway buffers and validates the full response before returning it. A
+failure while reading or decoding the body is classified like any other
+pre-commit provider failure, so the router may advance to the next target.
+This can duplicate a generation, as described in §3.4. A buffered upstream body
+is limited to 8 MiB; exceeding that fixed limit is a `TargetError`.
 
 ---
 
 ## 5. Provider Adapters — Notes Per Provider
 
-- **OpenAI**: near passthrough. Base URL `api.openai.com/v1`, `Authorization:
-  Bearer <key>`. Canonical format IS OpenAI's format, so this adapter is
-  mostly "forward the request, forward the response."
-- **Mistral**: OpenAI-compatible API. Base URL differs
-  (`api.mistral.ai/v1`), auth header same shape. Minimal translation, if any.
-- **DeepSeek**: OpenAI-compatible API. Same pattern as Mistral — different
-  base URL, same wire shape.
+- **OpenAI-compatible family**: one near-passthrough adapter serves `openai/`,
+  `mistral/`, `deepseek/`, and `openai_compatible/`. Canonical format is the
+  OpenAI shape. Branded prefixes provide default base URLs; the generic prefix
+  requires `api_base`. Authentication remains configurable per target, with the
+  branded v0.1 presets using bearer tokens. Provider presets must not fork the
+  wire implementation.
 - **Anthropic**: real translation required. Messages API has a distinct
   request shape (`system` as top-level field not a message role,
   `max_tokens` required, content blocks, different streaming event names —
@@ -341,98 +517,116 @@ the next target normally.
 - **Gemini (Generative Language API)**: `generateContent` /
   `streamGenerateContent` endpoints, API key as query param (`?key=`), request
   shape uses `contents[].parts[]`, roles are `user`/`model` not
-  `user`/`assistant`. Translation required.
-- **Vertex AI (Gemini via GCP)**: same Gemini request/response shape as
-  above, but auth is OAuth2 via service account JSON
-  (`vertex_credentials`), not a static API key, and the endpoint is
-  region/project-scoped (`vertex_location`, plus a GCP project ID — **note:
-  your example config is missing `vertex_project`; LiteLLM's actual schema
-  needs a project ID somewhere, either in config or inferred from the
-  credentials file. Flag this as a config schema gap to resolve before
-  implementation** — either add `vertex_project: <string>` to the schema or
-  extract it from the service account JSON's `project_id` field at load
-  time). Token refresh/caching for the GCP OAuth2 flow is a real chunk of
-  work — budget for it separately from the Gemini translation logic, since
-  it's shared infra (JWT signing, token cache with expiry) rather than
-  request/response translation.
+  `user`/`assistant`. Translation is required for messages, tool calls, tool
+  results, responses, and streaming events.
 
 **Suggested build order for adapters:** OpenAI → Mistral → DeepSeek (these
 three validate the server/router/config plumbing with near-zero translation
 work) → Anthropic (exercises translation) → Gemini (exercises translation +
-different auth) → Vertex (exercises translation + GCP OAuth2, hardest).
+different auth).
 
 ---
 
 ## 6. HTTP Surface
 
+### 6.1 Process CLI
+
+```text
+nano-llm --config <path> [--bind <address>] [--no-auth] [--validate]
+```
+
+- `--config` is required and names the YAML configuration file.
+- `--bind` defaults to `127.0.0.1:4000`; external/container exposure must be
+  requested explicitly, for example `--bind 0.0.0.0:4000`.
+- `--validate` loads and validates configuration, prints the redacted resolved
+  route table, and exits without binding a socket.
+- `--no-auth` is for local development and is rejected unless the bind address
+  is loopback.
+- Routes, providers, keys, and timeout values cannot be overridden by CLI flags;
+  YAML remains the single operational source of truth.
+- On SIGINT or SIGTERM, the server stops accepting new connections and allows
+  active requests and streams to finish. nano-llm has no internal shutdown
+  deadline setting; the process supervisor or container runtime may impose a
+  hard deadline externally.
+- The listener serves plain HTTP. nano-llm has no inbound certificate or TLS
+  configuration in v0.1; remote deployments must terminate TLS externally.
+  Connections from nano-llm to public providers continue to use verified HTTPS
+  with bundled trust roots.
+
+### 6.2 Endpoints
+
+Request bodies are limited to a fixed 1 MiB in v0.1. The limit is applied before
+JSON parsing and routing. Oversized requests receive an OpenAI-shaped 413
+response. The limit is intentionally not configurable while the canonical
+surface is text and tool schemas only.
+
+The process also enforces `general_settings.max_in_flight`, default 64, with a
+single semaphore applied only to `POST /v1/chat/completions` and acquired before
+buffering the request body. One generation request holds one permit for its
+whole lifetime, including fallback attempts and streaming. If no permit is
+immediately available, return an OpenAI-shaped 503; v0.1 does not maintain an
+internal waiting queue. `/health` and `/v1/models` bypass this semaphore so they
+remain available during generation saturation. This is a resource guard, not a
+per-key quota or rate limiter.
+
+For every request, accept `x-request-id` only when it contains 1–128 printable
+ASCII characters with no whitespace or control characters; otherwise generate
+a UUID. Return the chosen value in the `x-request-id` response header and attach
+it to every log record for that request. The gateway request ID is not forwarded
+upstream in v0.1.
+
 | Endpoint                  | Behavior                                                   |
 |----------------------------|--------------------------------------------------------------|
 | `POST /v1/chat/completions`| Main entry point. `model` field in body selects the group.  |
-| `POST /v1/completions`     | Legacy completions, v0.2 if needed — skip for v0.1 unless you need it. |
-| `POST /v1/embeddings`      | Same routing/failover logic, separate canonical shape.       |
 | `GET /health`              | Liveness only — does NOT check upstream provider health (no circuit breaker state to report). |
-| `GET /v1/models`           | Optional: list configured `model_name`s, for OpenAI-SDK compatibility with tools that call this. |
+| `GET /v1/models`           | Lists configured model-group names in the OpenAI models-list envelope. |
 
-Auth: `Authorization: Bearer <master_key>` required on all `/v1/*` routes.
-Reject with 401 before any routing/provider work happens.
+`/v1/completions` and `/v1/embeddings` are not implemented in v0.1 and return
+404. Adding either later requires its own canonical request/response types and
+provider support matrix; it must not be squeezed through the chat interface.
+
+Auth: `Authorization: Bearer <master_key>` is required on all `/v1/*` routes
+and compared without leaking timing information. Reject with 401 before any
+routing/provider work happens. `/health` is deliberately unauthenticated so a
+local supervisor or container runtime can perform a liveness check. `--no-auth`
+is for local development only and refuses to bind to a non-loopback address.
 
 ---
 
-## 7. Config → Your Pasted Example, Corrected
-
-Your example as given actually works fine for the "two separate model
-groups" case, EXCEPT the Vertex entries are missing `vertex_project` (see
-§5). Once that's resolved, this is close to valid v0.1 config as-is:
+## 7. Example configuration
 
 ```yaml
 model_list:
-  - model_name: mistral-fast
+  - model_name: fast
     litellm_params:
       model: mistral/mistral-small-latest
       api_key: os.environ/MISTRAL_API_KEY
 
-  - model_name: codestrol-latest
+  - model_name: fast
     litellm_params:
-      model: mistral/codestrol-latest
-      api_key: os.environ/MISTRAL_API_KEY
-
-  - model_name: vx-gemini-3.7-f
-    litellm_params:
-      model: vertex_ai/gemini-3.7-flash
-      vertex_location: "global"
-      vertex_project: os.environ/VERTEX_PROJECT_ID   # ADDED — see §5
-      vertex_credentials: os.environ/VERTEX_CREDENTIALS_PATH
-
-  - model_name: vx-gemini-3.6-f
-    litellm_params:
-      model: vertex_ai/gemini-3.6-flash
-      vertex_location: "global"
-      vertex_project: os.environ/VERTEX_PROJECT_ID
-      vertex_credentials: os.environ/VERTEX_CREDENTIALS_PATH
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
-  max_retries: 2
-  fallbacks:
-    - vx-gemini-3.7-f: [vx-gemini-3.6-f, mistral-fast]
+  overall_timeout: 120
 ```
 
-Each `model_name` here is its own group (no shared names in your example), so
-there's no *implicit* failover between any of them without the explicit
-`fallbacks:` block — added above as an illustration of the cross-group case.
+The two `fast` entries form one fallback route in file order.
 
 ---
 
 ## 8. Suggested Milestones
 
 1. **Config loader + validation** — parse the schema above, resolve env vars,
-   merge fallback groups, fail loudly on bad config. No server yet — a CLI
+   merge repeated names into ordered routes, fail loudly on bad config. No server yet — a CLI
    subcommand that just loads and pretty-prints the resolved routing table is
    a good first deliverable and a genuinely useful `--validate` flag long-term.
-2. **OpenAI adapter + non-streaming server** — `/v1/chat/completions`,
-   single target, no failover yet. Prove the axum server, auth middleware,
-   and canonical types work end to end against one real provider.
-3. **Failover + retry loop** — wire the router's target-iteration logic using
+2. **Canonical chat interface + OpenAI adapter** — validate the documented v0.1
+   request subset, then serve non-streaming `/v1/chat/completions` against one
+   target. Prove the axum server, auth middleware, and canonical types work end
+   to end against one real provider.
+3. **Failover loop** — wire the router's target-iteration logic using
    a mock/fault-injecting provider for tests (this is where you want good
    unit tests — simulate target 1 timing out, target 2 returning 429, target
    3 succeeding, and assert the client only ever sees the final success).
@@ -441,32 +635,170 @@ there's no *implicit* failover between any of them without the explicit
 5. **Mistral + DeepSeek adapters** — should be quick, near-identical to OpenAI.
 6. **Anthropic adapter** — first real translation layer.
 7. **Gemini adapter** — second translation layer, static API key auth.
-8. **Vertex adapter** — GCP OAuth2 token handling + same Gemini translation
-   logic reused.
-9. **Polish** — `/health`, `/v1/models`, SIGHUP config reload (stretch),
-   structured logging, ARM cross-compile + Docker `FROM scratch` build for
-   the Pi.
+8. **Polish** — `/health`, `/v1/models`, structured logging, ARM cross-compile,
+   and Docker `FROM scratch` build for the Pi.
 
 ---
 
-## 9. Open Questions / Decisions Needed Before Coding
+## 9. Decisions for v0.1
 
-- **`vertex_project`**: add to schema explicitly, or parse from the service
-  account JSON at load time? (Recommend explicit config field — fewer
-  surprises, matches how `vertex_location` is already explicit.)
-- **`general_settings.fallbacks` syntax**: the sketch above
-  (`- group_name: [target, target]`) is a list of single-key maps, which is
-  a bit awkward in YAML/serde. Consider instead:
-  ```yaml
-  fallbacks:
-    vx-gemini-3.7-f: [vx-gemini-3.6-f, mistral-fast]
-  ```
-  as a plain map, which is simpler to deserialize (`HashMap<String, Vec<String>>`)
-  and still readable.
-- **Per-target timeout defaults**: what's a sane default `request_timeout`
-  before a target is considered failed and the router advances? Suggest
-  30s default, overridable globally and per-target.
-- **Logging**: even without a dashboard, you'll want structured request logs
-  (which target served the request, how many targets were tried, latency) —
-  worth deciding early whether that's just `tracing` to stdout (simplest,
-  recommend this for v0.1) or something more.
+- **Product boundary:** nano-llm serves a single operator or small trusted team
+  needing a self-hosted reliability shim across a handful of providers. It is
+  deliberately not an organization-wide AI platform. One process, one config
+  file, one shared inbound key, static routing, and operational logs are in
+  scope; tenants, user administration, policy engines, metering, and analytics
+  are not.
+- **LiteLLM relationship:** configuration is LiteLLM-shaped for migration
+  familiarity, not LiteLLM-compatible or drop-in. nano-llm implements and
+  validates its own documented subset; unsupported settings must be removed or
+  translated rather than silently accepted.
+- **Vertex timing:** Vertex AI is deferred until after v0.1. The first release
+  establishes Gemini translation through the API-key Generative Language API
+  without taking on ADC, OAuth token lifecycle, workload identity, and
+  project/location endpoint construction.
+- **Fallback syntax:** entries sharing a `model_name` form one ordered route in
+  file order. v0.1 has no `general_settings.fallbacks` or other cross-group
+  references; reuse across routes requires repeating the target configuration.
+- **Model names:** public `model_name` aliases are case-sensitive, 1–128
+  characters, and match `[A-Za-z0-9][A-Za-z0-9._:/-]*` so they remain safe in
+  configuration output, API responses, and logs.
+- **Routing policy:** routes use fixed priority. Every request begins at the
+  first entry, and later entries receive traffic only after a failure. v0.1 has
+  no load balancing, weights, or dynamic cost/latency selection.
+- **Cross-request state:** there is no circuit breaker, health score, or passive
+  cooldown. Each request starts from the first route entry independently. A
+  failing primary may therefore add its timeout to every request until the
+  operator lowers that timeout, reorders the route, or restores the target.
+- **Config lifecycle:** configuration and referenced environment values are
+  loaded and validated once at startup, then remain immutable for the process
+  lifetime. v0.1 has no SIGHUP or API-driven reload; applying changes requires
+  a process restart.
+- **CLI:** the process exposes only `--config`, `--bind`, `--validate`, and
+  `--no-auth`. The config path is required, bind defaults to
+  `127.0.0.1:4000`, validation exits before serving, and no routing or provider
+  setting can be overridden from the command line.
+- **Shutdown:** SIGINT and SIGTERM trigger graceful server shutdown: stop
+  accepting new work and allow in-flight requests/streams to finish. There is
+  no gateway shutdown-timeout knob; supervisors own any hard termination
+  deadline.
+- **TLS boundary:** the inbound listener is HTTP-only. TLS certificates,
+  termination, and ACME belong to an external reverse proxy, tunnel, or load
+  balancer. Upstream provider traffic still uses verified HTTPS with bundled
+  trust roots.
+- **Timeout:** `request_timeout` defaults to 30 seconds and is overridable
+  globally and per target. `overall_timeout` defaults to 120 seconds for the
+  entire pre-commit attempt/fallback chain. For a stream, `overall_timeout` ends
+  at commitment; `request_timeout` then resets after each canonical chunk and
+  closes a stream that remains idle for too long. Progressing streams have no
+  total generation-duration limit.
+- **Output-token default:** `max_tokens` is optional and has no gateway default.
+  If omitted, each provider/model applies its native behavior; nano-llm does not
+  impose an arbitrary truncation limit in pursuit of false cross-provider
+  equivalence.
+- **Output-token aliases:** clients may send `max_tokens` or
+  `max_completion_tokens`, but not both. Either is normalized into one canonical
+  output-token limit and mapped to the selected provider's preferred field.
+- **Temperature range:** canonical `temperature` is limited to 0 through 1 so
+  every v0.1 provider family can represent it. Values above 1 are rejected
+  before routing even when a particular upstream would accept them.
+- **Stop sequences:** accept one string or a list of at most four nonempty
+  strings, each no larger than 256 UTF-8 bytes. Normalize the scalar form to a
+  one-element list before routing.
+- **Compatibility surface:** v0.1 implements text chat plus portable function
+  tool calling through `/v1/chat/completions`, along with `/v1/models` and
+  `/health`. Legacy completions, embeddings, multimodal input, structured
+  output, and provider-specific extensions are deferred and rejected rather
+  than silently degraded.
+- **Streaming usage:** `stream_options.include_usage` is supported as a
+  best-effort passthrough. If requested, a final usage chunk is emitted only
+  when the selected provider supplies streaming usage; missing values are not
+  estimated. All other `stream_options` fields are rejected.
+- **Tool-choice boundary:** `tool_choice` supports `auto`, `none`, `required`,
+  and a specifically named function. Responses may contain multiple tool calls,
+  but the `parallel_tool_calls` request control is rejected because nano-llm
+  does not promise equivalent parallel-generation behavior across providers.
+- **Instruction roles:** leading `system` and `developer` messages are accepted,
+  kept in order, and combined into each provider's system-instruction format.
+  Either role is rejected if it appears after the conversational messages begin.
+- **Tool-schema boundary:** validate the OpenAI function-tool wrapper, unique
+  function names matching `[A-Za-z0-9_-]{1,64}`, and that `parameters` is a JSON
+  object, but otherwise preserve the schema as opaque JSON. Apply the same name
+  rule to named `tool_choice` values and assistant tool calls; adapters never
+  rename tools. v0.1 does not validate a portable keyword subset, resolve
+  references, or rewrite schemas. Advanced-schema fallback portability is best
+  effort; an upstream rejection advances to the next target.
+- **Tool-history validity:** assistant tool-call IDs must be nonempty and unique,
+  and call names must exist in the request's tool definitions. Tool results may
+  arrive in any order but must resolve each immediately preceding call exactly
+  once before conversation continues. Invalid transcripts return 400 before
+  routing.
+- **Tool arguments:** canonical `function.arguments` is an opaque string, not a
+  gateway-validated JSON object. OpenAI-compatible paths preserve it exactly;
+  adapters that require an object parse it locally, and parse failure is a
+  target error. Malformed model-generated argument JSON is not globally treated
+  as an invalid successful response.
+- **Attempt policy:** each configured route entry is attempted at most once.
+  Every target error advances immediately; canonical validation errors stop
+  before routing. Repeating a target in configuration is the explicit way to
+  request another attempt. Client disconnection cancels all work.
+- **Error contract:** target-error kinds are diagnostics, not routing policies.
+  Exhausting a route returns a stable OpenAI-shaped 502; expiration of the
+  overall deadline returns 504. Provider-specific statuses and raw bodies are
+  not forwarded merely because that provider was attempted last.
+- **Semantic neutrality:** any well-formed successful provider response ends
+  routing, including refusals, filtered or length-limited completions, and valid
+  tool-call-only responses. nano-llm never grades content or triggers fallback
+  based on semantic quality.
+- **Finish reasons:** expose only `stop`, `length`, `tool_calls`, and
+  `content_filter`. Unknown successful terminal reasons normalize to `stop` and
+  are logged at debug level rather than causing fallback.
+- **Redirect policy:** upstream redirects are never followed. Every 3xx is a
+  target failure and advances the route, preventing credentials from being
+  replayed to a redirect destination.
+- **Request size:** inbound request bodies have a fixed 1 MiB limit applied
+  before parsing and routing. Oversized requests return an OpenAI-shaped 413.
+  v0.1 exposes no setting for this limit.
+- **Upstream size limits:** buffered non-streaming response bodies are capped at
+  8 MiB and individual decoded SSE events at 1 MiB. Total streaming bytes are
+  uncapped and processed incrementally. A pre-commit violation may fall back;
+  a post-commit SSE violation closes the stream. These limits are fixed in v0.1.
+- **Concurrency guard:** `general_settings.max_in_flight` is a process-wide
+  generation semaphore and defaults to 64. Capacity is acquired before body
+  buffering and held for the request lifetime. When full, chat completions
+  immediately return an OpenAI-shaped 503; there is no internal queue.
+  `/health` and `/v1/models` bypass the guard.
+- **Provider architecture:** implementation is organized by wire protocol, not
+  provider brand. OpenAI, Mistral, DeepSeek, and custom compatible endpoints
+  share one OpenAI-compatible adapter; branded prefixes are thin defaults.
+  Post-v0.1 Vertex support will reuse the Gemini translation layer while adding
+  its own GCP authentication and endpoint construction.
+- **Custom endpoint authentication:** `openai_compatible/` requires `api_base`
+  but not `api_key`. When a key is present it is sent as a bearer token; when
+  absent, no authorization header is added. Branded cloud presets continue to
+  require their API keys.
+- **Secret sources:** `master_key` and every present provider `api_key` must use
+  `os.environ/VAR_NAME`; inline secret literals are rejected. The generic
+  OpenAI-compatible adapter may omit its key entirely.
+- **Provider seam:** adapters receive one validated canonical `ChatRequest` and
+  return a canonical `ChatResponse` or `ChatChunk` stream. Routing does not know
+  provider authentication, URLs, or wire formats.
+- **Streaming commitment:** no downstream status, headers, or body are sent
+  until the first canonical chunk is valid. After commitment, any upstream
+  failure closes the stream and never triggers fallback.
+- **Logging:** use `tracing` and `tracing-subscriber` to write structured fields
+  to stdout. Log one completion record per inbound request with its validated or
+  generated request ID, requested model, selected provider/model, attempt count,
+  outcome, status code, and elapsed milliseconds. Log failed attempts at debug
+  level and the exhausted/fatal result at warn level. Never log request or
+  response bodies, API keys, authorization headers, access tokens, or credential
+  contents. Human-readable output is the only v0.1 formatter; JSON formatting,
+  telemetry exporters, log storage, and analytics are out of scope.
+- **Request IDs:** accept `x-request-id` only as 1–128 printable, non-whitespace
+  ASCII characters; otherwise generate a UUID. Return the chosen ID in the same
+  response header and include it in all request logs. Do not forward it upstream
+  in v0.1.
+- **Packaging:** release artifacts target statically linked Linux binaries for
+  `x86_64` and `aarch64`, suitable for a `FROM scratch` container. TLS trust
+  roots must be bundled, and the gateway must not shell out to provider CLIs at
+  runtime. The <20MB idle-RSS goal is measured in a release build and treated
+  as a target to verify, not a reason to compromise correctness.

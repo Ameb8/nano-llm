@@ -210,6 +210,8 @@ the override's hostname.
 
 ### 2.5 Validation at load time
 
+- `model_list` must contain at least one entry. An empty list is a fatal startup
+  validation error naming `model_list`.
 - Every `model_list` entry must have `model_name` and `litellm_params.model`.
 - `model_name` is case-sensitive, 1–128 characters, and must match
   `[A-Za-z0-9][A-Za-z0-9._:/-]*`.
@@ -344,11 +346,14 @@ multimodal parts, response schemas, provider-specific extensions, or unknown
 fields. This is deliberately narrower than the full OpenAI interface.
 
 `system` and `developer` messages are accepted only as a leading instruction
-prefix before the first `user`, `assistant`, or `tool` message. Their order is
-preserved and adapters combine them into the provider's system-instruction
-representation. Either role appearing after the conversation begins is a 400
-validation error. `developer` is an inbound compatibility role, not a distinct
-provider capability.
+prefix before the first `user`, `assistant`, or `tool` message. Every adapter
+combines their content strings in request order using exactly two newline
+characters (`\n\n`) between adjacent strings. It preserves every content string
+verbatim, including empty strings, inserts no role labels or other text, and
+sends the resulting single string through the provider's system-instruction
+field. Either role appearing after the conversation begins is a 400 validation
+error. `developer` is an inbound compatibility role, not a distinct provider
+capability.
 
 Tool calling is part of the canonical interface rather than a provider-specific
 extension. Tool definitions use the OpenAI function-tool shape; assistant tool
@@ -698,6 +703,20 @@ upstream in v0.1.
 | `POST /v1/chat/completions`| Main entry point. `model` field in body selects the group.  |
 | `GET /health`              | Liveness only — does NOT check upstream provider health (no circuit breaker state to report). |
 | `GET /v1/models`           | Lists configured model-group names in the OpenAI models-list envelope. |
+
+Whenever the process can serve HTTP, `GET /health` returns HTTP 200 with
+`Content-Type: application/json` and the exact body `{"status":"ok"}`. It
+never inspects configured targets or upstream health.
+
+`GET /v1/models` returns exactly one model object for each unique configured
+`model_name`, using this exact envelope and field set for every entry:
+
+```json
+{"object":"list","data":[{"id":"<model_name>","object":"model","created":0,"owned_by":"nano-llm"}]}
+```
+
+Entries are ordered by the first appearance of each `model_name` in
+`model_list`. Repeated fallback targets never create duplicate public entries.
 
 `/v1/completions` and `/v1/embeddings` are not implemented in v0.1 and return
 404. Adding either later requires its own canonical request/response types and

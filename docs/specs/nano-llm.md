@@ -510,10 +510,38 @@ OpenAI-compatible response solely because a model emitted malformed JSON
 arguments. Native object arguments from Anthropic or Gemini are serialized as
 compact JSON without relying on object-member order.
 
+Every completed canonical response tool call has exactly this shape:
+
+```json
+{"id":"<opaque-call-id>","type":"function","function":{"name":"<declared-name>","arguments":"<opaque-string>"}}
+```
+
+The call ID must be nonempty and unique within the response. An adapter
+preserves a native ID when it is nonempty and does not collide with an earlier
+call in that response; otherwise it generates a unique opaque ID beginning
+with `call_`. A generated ID remains stable for that call throughout a stream.
+The function name must match a tool declared in the canonical request. A tool
+call when the request has no tools or canonical `tool_choice: "none"`, or a
+call naming an undeclared function, is an `InvalidResponse`.
+
+Provider output must honor the remaining canonical tool-choice constraint. A
+response to `tool_choice: "required"` must contain at least one completed tool
+call, and a response to a named choice must contain at least one call and every
+call must use that named function. A canonical `content_filter` response is the
+sole exception because a provider safety or policy decision is a successful
+semantic outcome rather than a tool-protocol violation. For all other finish
+reasons, violating the tool-choice constraint is an `InvalidResponse`. In both
+streaming and non-streaming responses, at least one completed call requires
+`finish_reason: "tool_calls"`, and that finish reason requires at least one
+completed call.
+
 The canonical non-streaming response contains `id`, `object`, `created`,
 `model`, `choices`, and `usage` when the upstream reports usage. Each choice
 contains `index`, an assistant message with text content and/or normalized tool
-calls, and a normalized `finish_reason`.
+calls, and a normalized `finish_reason`. The sole empty-message exception is a
+canonical `content_filter` choice, which may have `content: null` and no tool
+calls when the provider reports a well-formed safety or policy block without
+candidate content.
 
 The exact non-streaming choice shape is `index`, `message`, and
 `finish_reason`. The exact assistant response-message shape is
@@ -580,18 +608,63 @@ A streaming tool-call delta contains `index` and may contain `id`,
 `type: "function"`, or a `function` object containing partial string `name`
 and/or `arguments`. Indices start at zero, are introduced in increasing order,
 and identify one call for the life of the stream. The adapter assembles each
-call internally while forwarding deltas, rejects a changed ID or name, and at
-the terminal chunk verifies that every call has a nonempty ID, a declared tool
-name, and a complete native argument value. Exactly one terminal chunk is
-required; an ordinary chunk after it, a second terminal chunk, or `[DONE]`
-before it is an invalid stream.
+call internally while forwarding deltas and concatenates name and argument
+fragments separately in arrival order. If the index-introducing delta contains
+a usable native ID, the adapter preserves it and rejects any different later
+ID for that call. If that delta omits the ID or contains an empty or colliding
+one, the adapter immediately generates a stable ID, forwards it with the first
+delta, and ignores any later native ID for that call. At the terminal chunk it
+verifies that every completed call satisfies the canonical response-call shape
+and tool-choice constraints above. A terminal
+`tool_calls` finish reason requires at least one completed call, and the
+presence of any completed call requires `tool_calls`; a mismatch is an
+`InvalidResponse`. Exactly one terminal chunk is required; an ordinary chunk
+after it, a second terminal chunk, or `[DONE]` before it is an invalid stream.
 
 Final finish reasons are normalized to four OpenAI-shaped values: normal end or
-stop-sequence completion becomes `stop`, an output limit becomes `length`, tool
-invocation becomes `tool_calls`, and a safety/policy block becomes
-`content_filter`. An unknown terminal reason on an otherwise well-formed 2xx
-response becomes `stop`; the safe upstream reason is logged at debug level and
-does not trigger fallback.
+stop-sequence completion becomes `stop`, an output or context limit becomes
+`length`, a completed tool invocation becomes `tool_calls`, and a safety,
+policy, recitation, blocklist, prohibited-content, or unsupported-language block
+becomes `content_filter`. Tool-call presence takes precedence over a provider's
+ordinary stop reason so a completed call always produces `tool_calls`.
+
+A provider-native terminal condition that reports operational or protocol
+failure is not a successful finish reason merely because it arrived in a 2xx
+response. Resource exhaustion, including DeepSeek
+`insufficient_system_resource`, becomes an `Overloaded` `TargetError`.
+Malformed or unexpected function calls, too many tool calls, missing required
+tool protocol state, and malformed provider responses become
+`InvalidResponse`. Normative branded mappings include:
+
+- Anthropic `end_turn` and `stop_sequence` → `stop`; `max_tokens` and
+  `model_context_window_exceeded` → `length`; `tool_use` → `tool_calls`;
+  `refusal` → `content_filter`; and `pause_turn` → `InvalidResponse` because
+  v0.1 cannot represent or continue provider-executed server-tool state.
+- Gemini `STOP` → `stop` unless completed calls make it `tool_calls`;
+  `MAX_TOKENS` → `length`; `SAFETY`, `RECITATION`, `LANGUAGE`, `BLOCKLIST`,
+  `PROHIBITED_CONTENT`, and `SPII` → `content_filter`; and
+  `MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`,
+  `MISSING_THOUGHT_SIGNATURE`, and `MALFORMED_RESPONSE` → `InvalidResponse`.
+  A terminal `FINISH_REASON_UNSPECIFIED` is also `InvalidResponse`.
+- DeepSeek `insufficient_system_resource` → `Overloaded`; its standard
+  `stop`, `length`, `tool_calls`, and `content_filter` values retain their
+  canonical meanings.
+
+Before stream commitment these conditions may fall back; after commitment they
+close the stream under §4. An unknown terminal reason on an otherwise
+structurally valid response containing text is normalized to `stop` and logged
+at debug level. Completed calls take the `tool_calls` precedence above; an
+unknown reason accompanied by neither text nor completed calls is
+`InvalidResponse`.
+
+When a provider reports a well-formed provider-level safety or policy block
+without a native candidate or choice, the adapter synthesizes the one required
+canonical choice with `index: 0`, `content: null`, no tool calls, and
+`finish_reason: "content_filter"`. For streaming, it emits one ordinary
+terminal chunk whose delta contains `role: "assistant"` and no content, then
+the normal `[DONE]` event. This normalization is limited to explicit native
+safety or policy signals; adapters must not synthesize empty success for a
+missing or malformed candidate.
 
 The adapter for a configured target satisfies this interface:
 
@@ -820,19 +893,29 @@ to silently omit a field.
 | User text | `user` message | User text content block | `user` text part |
 | Assistant text | `assistant` message | Assistant text content block | `model` text part |
 | Assistant tool call | OpenAI `tool_calls` unchanged | Assistant `tool_use` block | Model `functionCall` part |
-| Tool result | `tool` message keyed by `tool_call_id` | User `tool_result` block keyed by native call ID | User `functionResponse` part keyed by function name |
+| Tool result | `tool` message keyed by `tool_call_id` | User `tool_result` block keyed by call ID | User `functionResponse` part carrying the call ID, function name, and `response: {"result": <content-string>}` |
 | `auto` / `none` / `required` / named choice | Native equivalent | Native equivalent | Native equivalent |
 | `max_tokens` | Provider's supported OpenAI-compatible output-token field | `max_tokens` | Native maximum-output-token field |
 | `stop` | `stop` scalar/list as supported by the shared wire family | Native stop-sequence list | Native stop-sequence list |
 | `temperature`, `top_p` | Same-named fields | Same semantic native fields | Same semantic native fields |
 
-For a Gemini tool result, the adapter resolves the canonical `tool_call_id` to
-the function name recorded on the immediately preceding assistant call. If a
-native provider response has a tool call but no stable call ID, the adapter
-generates one opaque ID beginning with `call_`, uses the same ID for all deltas
-of that call, and exposes it in the final canonical history. Native IDs are
-preserved when present and valid. Generated IDs carry no provider meaning and
-need only be unique within the response.
+For Gemini history, the adapter resolves each canonical `tool_call_id` against
+the immediately preceding assistant call. It reconstructs the Gemini
+`functionCall` with that canonical ID, function name, and the parsed argument
+object. It emits the matching `functionResponse` with the same ID and name and
+maps the canonical tool-result content string deterministically to
+`response: {"result": <content-string>}`. The value of `result` preserves the
+canonical string exactly; it is never parsed as JSON or substituted directly as
+the response object. This ID-plus-name mapping preserves correlation when one
+assistant turn calls the same function more than once and when results arrive
+in non-call order.
+
+If any provider response has a tool call without a usable native call ID, the
+adapter generates one opaque ID beginning with `call_`, uses the same ID for all
+deltas of that call, and exposes it in the final canonical history. Native IDs
+are preserved only when nonempty and unique within the response; missing,
+empty, or colliding IDs are replaced. Generated IDs carry no provider meaning
+and need only be unique within the response.
 
 Adapters must have conformance tests for every row above in both request and
 response directions, including multiple tool calls and multiple results in
@@ -1135,8 +1218,12 @@ The two `fast` entries form one fallback route in file order.
 - **Tool-choice boundary:** `tools`, when present, is nonempty. `tool_choice`
   is rejected when `tools` is absent. Omission normalizes to `auto` with tools
   and `none` without tools. A named choice must match a declared function;
-  violations return 400 before routing. Responses may contain multiple tool
-  calls, but `parallel_tool_calls` is rejected because nano-llm does not promise
+  request violations return 400 before routing. Provider responses must also
+  honor the canonical choice: `none` forbids calls, `required` requires at least
+  one, and a named choice requires all returned calls to use that function. An
+  explicit `content_filter` result is the sole exception. Other response
+  violations are `InvalidResponse`. Responses may contain multiple tool calls,
+  but `parallel_tool_calls` is rejected because nano-llm does not promise
   equivalent parallel-generation behavior across providers.
 - **Instruction roles:** leading `system` and `developer` messages are accepted,
   kept in order, and combined into each provider's system-instruction format.
@@ -1159,6 +1246,13 @@ The two `fast` entries form one fallback route in file order.
   Anthropic or Gemini require every argument string to parse as exactly one JSON
   object during gateway validation; other routes preserve it opaquely. This
   route-level rule ensures every configured fallback can represent the request.
+- **Response tool calls:** completed calls use the exact OpenAI function-call
+  shape, have nonempty IDs unique within the response, name declared tools, and
+  agree with both canonical `tool_choice` and terminal `finish_reason`.
+  Adapters preserve usable native IDs and synthesize stable `call_` IDs for
+  missing, empty, or colliding ones. Gemini history carries the canonical ID and
+  function name in both `functionCall` and `functionResponse`; string tool
+  results become `response: {"result": <content-string>}` without parsing.
 - **Attempt policy:** each configured route entry is attempted at most once.
   Every target error advances immediately; canonical validation errors stop
   before routing. Repeating a target in configuration is the explicit way to
@@ -1175,10 +1269,15 @@ The two `fast` entries form one fallback route in file order.
 - **Semantic neutrality:** any well-formed successful provider response ends
   routing, including refusals, filtered or length-limited completions, and valid
   tool-call-only responses. nano-llm never grades content or triggers fallback
-  based on semantic quality.
+  based on semantic quality. Explicit provider-native operational or protocol
+  failures remain target failures even when transported in a 2xx response.
 - **Finish reasons:** expose only `stop`, `length`, `tool_calls`, and
-  `content_filter`. Unknown successful terminal reasons normalize to `stop` and
-  are logged at debug level rather than causing fallback.
+  `content_filter`. Resource-exhaustion reasons become `Overloaded`; malformed
+  or inconsistent protocol/tool reasons become `InvalidResponse`; safety and
+  policy reasons become `content_filter`, including a synthesized empty
+  canonical choice when the provider supplies an explicit block without a
+  candidate. Only an otherwise structurally valid unknown terminal reason
+  normalizes to `stop` and is logged at debug level.
 - **Redirect policy:** upstream redirects are never followed. Every 3xx is a
   target failure and advances the route, preventing credentials from being
   replayed to a redirect destination.

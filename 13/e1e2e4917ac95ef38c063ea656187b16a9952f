@@ -1,0 +1,22 @@
+docs/specs/nano-llm.md
+  s_b1ee8e2f7d0478::t_f5ebc26df8b382 653-658
+  s_b1ee8e2f7d0478::t_e00954f83b634d 611-618
+  s_b1ee8e2f7d0478::t_608929e208f737 533-536,636-652
+  s_b1ee8e2f7d0478::t_1c6aeede258373 513-532,537,541-544,619-622,625-635,659-667,896,902-918,1221-1226,1249-1255,1272-1273,1275-1280
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.4.12",
+  "base_commit_sha": "13e1e2e4917ac95ef38c063ea656187b16a9952f",
+  "prompts": {},
+  "sessions": {
+    "s_b1ee8e2f7d0478": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0568d-aa34-7483-af39-1acaf57f2400",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Alex Buckley <alexmeb81@outlook.com>"
+    }
+  }
+}

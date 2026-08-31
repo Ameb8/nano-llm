@@ -1,0 +1,19 @@
+README.md
+  s_8dd1f9ec55e85f::t_6d94ac324514f2 3,5,7,9,11-15,17,21,25,30-31,33-34,37,39-40,43-58,60,62,65,68,70-78,81,83-85,88-90,92-93,97-99,101,103,105-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.4.12",
+  "base_commit_sha": "8999da9d7c93699109000994e543dbd94963623c",
+  "prompts": {},
+  "sessions": {
+    "s_8dd1f9ec55e85f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a056ab-ab15-7161-9813-bcfa36e78e14",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "Alex Buckley <alexmeb81@outlook.com>"
+    }
+  }
+}

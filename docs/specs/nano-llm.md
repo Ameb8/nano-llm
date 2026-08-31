@@ -17,6 +17,16 @@ logs over multi-user administration, dynamic policy systems, metering, or
 analytics. It should remain comfortable to run on a laptop, Raspberry Pi, small
 VM, or minimal container.
 
+### Release terminology
+
+`v0.1` is the first public release described by this document. The milestones in
+§8 are implementation slices, not separately conforming releases and not alternate
+definitions of a "V1." A binary is v0.1-conformant only when it implements the
+entire documented v0.1 surface, including every listed provider family, streaming,
+tool calling, validation, operational endpoints, and release packaging. Earlier
+milestones may be runnable and useful during development, but must identify
+themselves as development builds rather than claiming v0.1 conformance.
+
 ---
 
 ## 1. Goals / Non-Goals
@@ -73,7 +83,7 @@ model_list:
       model: <provider>/<upstream-model-id>
       api_key: os.environ/<VAR>   # env reference required when key is present
       api_base: <string>          # optional override, e.g. self-hosted/proxy endpoints
-      timeout: <seconds>          # optional, per-target override
+      timeout: <int seconds>      # optional, per-target override
 
   - model_name: <string>          # SAME model_name reused = additional fallback target
     litellm_params:
@@ -81,9 +91,9 @@ model_list:
 
 general_settings:
   master_key: os.environ/<VAR>
-  request_timeout: <seconds>      # global default, per-target override wins
-  overall_timeout: <seconds>      # whole fallback chain; default 120 seconds
-  max_in_flight: <int>            # process-wide request cap; default 64
+  request_timeout: <int seconds>  # global default, per-target override wins
+  overall_timeout: <int seconds>  # whole fallback chain; default 120 seconds
+  max_in_flight: <int 1..65535>   # process-wide request cap; default 64
 ```
 
 ### 2.2 Key design decision: how fallback groups are formed
@@ -118,15 +128,28 @@ latency-based, or cost-based target selection.
 
 ### 2.3 `os.environ/VAR` resolution
 
-Any string value of the exact form `os.environ/VAR_NAME` is resolved from the
-process environment at config-load time. Missing env var → fail fast at startup
-with a clear error naming the config path and var name. No silent empty-string
-fallback.
+Environment references are recognized only in the secret fields `master_key`
+and `api_key`. In those fields, a value of the exact form
+`os.environ/VAR_NAME` is resolved from the process environment at config-load
+time. Missing env var → fail fast at startup with a clear error naming the
+config path and var name. No silent empty-string fallback. The same spelling in
+`model_name`, `model`, `api_base`, or any other non-secret string is an ordinary
+literal and is then validated by that field's normal rules.
 
 Secret fields do not accept literal values in v0.1. `master_key` and every
 present `api_key` must use the exact `os.environ/VAR_NAME` form; inline secrets
 are config errors. The generic `openai_compatible/` adapter may omit `api_key`
 entirely as described below.
+
+At config-load time, every resolved `master_key` and `api_key` must be a
+nonempty UTF-8 string containing no ASCII control characters. Secret values
+are preserved exactly and are never trimmed. A value that cannot be encoded by
+its configured HTTP header credential transport is a startup configuration
+error rather than a runtime target failure. Gemini query credentials are not
+subject to HTTP-header encoding, but are structurally percent-encoded as query
+values as specified in §2.4. Each validation error names the configuration path
+and environment-variable name needed to correct it, but never includes the
+resolved value.
 
 Secret values are treated specially. `master_key`, provider API keys,
 authorization headers, and access tokens are never printed or logged. The
@@ -221,10 +244,15 @@ the override's hostname.
 - A `gemini/` suffix must additionally match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`.
 - Branded provider prefixes require `api_key`. `openai_compatible/` may omit it.
 - Every explicit `api_base` must satisfy the URL and transport rules in §2.3.
-- `request_timeout` and per-target `timeout` values must be positive. The
-  default is 30 seconds.
-- `overall_timeout` must be positive and defaults to 120 seconds.
-- `max_in_flight` must be positive and defaults to 64.
+- `request_timeout`, `overall_timeout`, and every per-target `timeout` must be
+  YAML integers representing whole seconds from 1 through 86,400 inclusive.
+  Floats (including integral-looking values such as `30.0`), strings, booleans,
+  nulls, and out-of-range integers are config errors that name the field path.
+  `request_timeout` defaults to 30 and `overall_timeout` defaults to 120.
+- `max_in_flight` must be a YAML integer from 1 through 65,535 inclusive and
+  defaults to 64. Floats (including integral-looking values such as `64.0`),
+  strings, booleans, nulls, and out-of-range integers are config errors that
+  name `general_settings.max_in_flight`.
 - All `os.environ/*` references must resolve.
 - `master_key` and every present `api_key` must be environment references, not
   inline literals.
@@ -235,6 +263,25 @@ the override's hostname.
 - Unknown top-level, `general_settings`, and `litellm_params` keys are config
   errors in v0.1. This gateway implements a documented LiteLLM-shaped subset;
   it must not silently accept settings that it does not honor.
+- Duplicate key names at any YAML mapping depth are fatal configuration errors
+  that name the duplicate's configuration path. This rule applies during both
+  normal startup and `--validate`.
+
+### 2.6 Accepted YAML subset and CLI-dependent validation
+
+The configuration file contains exactly one YAML document. Multiple documents,
+custom tags, aliases, anchors, and merge keys (`<<`) are rejected, as are
+non-string mapping keys. These restrictions keep duplicate detection, error
+paths, and file-order routing deterministic across parser implementations.
+
+`general_settings` is required during authenticated operation. Under
+`--no-auth`, it may be omitted entirely, in which case all of its non-auth
+members use their documented defaults. If `general_settings.master_key` is
+present under `--no-auth`, it is still resolved and validated; the flag disables
+authentication, not validation of configured data. `--validate --no-auth`
+applies these same rules and still rejects a non-loopback `--bind`, even though
+it exits before opening a listener. Route grouping and all other semantic
+validation occur after secret resolution.
 
 ---
 
@@ -325,6 +372,33 @@ Supported request fields are:
 | `tools` | Optional OpenAI-shaped function-tool definitions. The portable v0.1 subset is translated by every adapter. |
 | `tool_choice` | Optional; supports `auto` (default when tools are present), `none`, `required`, or one specifically named function in OpenAI's object form. |
 
+`max_tokens` and `max_completion_tokens` accept JSON integers from 1 through
+2,147,483,647. Booleans, floats, strings, nulls, zero, negative values, and
+larger integers are validation errors. Canonical and emitted usage counters are
+unsigned 64-bit integers; a provider value outside that range is invalid usage
+and is handled under the usage-omission rule below.
+
+The following nested request shapes are normative. Each object admits only the
+members shown here, except for the opaque contents of `parameters`:
+
+| Shape | Required members | Optional members |
+|-------|------------------|------------------|
+| `system`, `developer`, or `user` message | `role`, string `content` | none |
+| `assistant` message | `role` | string-or-null `content`, nonempty `tool_calls` |
+| `tool` message | `role`, string `tool_call_id`, string `content` | none |
+| assistant tool call | string `id`, `type: "function"`, `function` | none |
+| assistant tool-call `function` | string `name`, string `arguments` | none |
+| tool definition | `type: "function"`, `function` | none |
+| tool-definition `function` | string `name` | string `description`, object `parameters` |
+| named `tool_choice` | `type: "function"`, `function` | none |
+| named-choice `function` | string `name` | none |
+| `stream_options` | boolean `include_usage` | none |
+
+An assistant message must contain string content and/or at least one tool call;
+`content: null` and omitted `content` are equivalent canonically. Empty strings
+are valid content. `description` may be empty. An omitted `parameters` member is
+preserved as omitted rather than replaced with an invented schema.
+
 `messages` must be a nonempty JSON array. For `system`, `developer`, `user`,
 and `tool` messages, `content` is required and must be a JSON string. For an
 `assistant` message, `content` may be a JSON string; it may be `null` or
@@ -345,6 +419,24 @@ the unsupported field. In particular, v0.1 does not silently discard
 multimodal parts, response schemas, provider-specific extensions, or unknown
 fields. This is deliberately narrower than the full OpenAI interface.
 
+This strictness applies recursively to every gateway-defined request object,
+including message objects, assistant tool calls, tool definitions, and
+`tool_choice` objects. An unknown member at any of these levels is a gateway
+400 `invalid_request` error rather than being ignored or forwarded to an
+adapter. The sole opaque nested region is
+`tools[].function.parameters`: after validating that it is a JSON object, the
+gateway preserves all of its members as schema content. For a nested validation
+error, `param` is the containing top-level field (`messages`, `tools`, or
+`tool_choice`), and the safe error `message` identifies the precise nested path.
+
+Duplicate JSON member names are rejected at every object depth before semantic
+deserialization, including within `tools[].function.parameters`. This is a
+syntax-level uniqueness rule and does not interpret or restrict JSON Schema
+semantics. A duplicate returns 400 `invalid_request` before routing. For a
+top-level duplicate, `param` is that duplicated field; for a nested duplicate,
+`param` is its containing top-level field. The safe error `message` identifies
+the precise duplicate path.
+
 `system` and `developer` messages are accepted only as a leading instruction
 prefix before the first `user`, `assistant`, or `tool` message. Every adapter
 combines their content strings in request order using exactly two newline
@@ -354,6 +446,17 @@ sends the resulting single string through the provider's system-instruction
 field. Either role appearing after the conversation begins is a 400 validation
 error. `developer` is an inbound compatibility role, not a distinct provider
 capability.
+
+After that optional instruction prefix, the conversation must begin with a
+`user` message and alternate user-side and assistant turns. A single `user`
+message is one user-side turn. An immediately following contiguous group of
+`tool` results that resolves the preceding assistant tool calls is also one
+user-side turn. Consecutive `user` messages, consecutive assistant messages,
+an initial assistant or tool message, and a `user` message immediately after a
+tool-result group are validation errors on `messages`. The request must end on
+a user-side turn (`user` or a complete tool-result group), because the endpoint
+is asking the provider to generate the next assistant turn. This portable state
+machine avoids relying on adapter-specific role-coalescing behavior.
 
 Tool calling is part of the canonical interface rather than a provider-specific
 extension. Tool definitions use the OpenAI function-tool shape; assistant tool
@@ -391,18 +494,57 @@ call receives exactly one result, multiple results may arrive in any order, and
 all calls must be resolved before another `user` or `assistant` turn begins.
 Violations are gateway validation errors and return 400 before routing.
 
-`function.arguments` remains an opaque string in the canonical message and
-response types. OpenAI-compatible adapters preserve it unchanged, even when it
-is not valid JSON. Adapters such as Anthropic and Gemini parse the string only
-when their native wire format requires an argument object; failure to parse is
-a `TargetError` for that target and advances the route. nano-llm does not reject
-an otherwise well-formed OpenAI-compatible response solely because a model
-emitted malformed JSON arguments.
+For inbound tool-call history, `function.arguments` is normally an opaque
+string. If the selected route contains an Anthropic or Gemini target, every such
+string must parse as exactly one JSON object with no trailing data; failure is a
+gateway 400 on `messages` before routing. This is route-level canonical
+validation, parallel to the Anthropic output-token rule, and ensures the same
+request is representable by every fallback target. OpenAI-compatible adapters
+preserve the original argument string unchanged. Translation adapters use the
+parsed object without reinterpreting its schema.
+
+For provider responses, `function.arguments` remains an opaque canonical
+string. OpenAI-compatible adapters preserve it unchanged even when it is not
+valid JSON, and nano-llm does not reject an otherwise well-formed successful
+OpenAI-compatible response solely because a model emitted malformed JSON
+arguments. Native object arguments from Anthropic or Gemini are serialized as
+compact JSON without relying on object-member order.
 
 The canonical non-streaming response contains `id`, `object`, `created`,
 `model`, `choices`, and `usage` when the upstream reports usage. Each choice
 contains `index`, an assistant message with text content and/or normalized tool
 calls, and a normalized `finish_reason`.
+
+The exact non-streaming choice shape is `index`, `message`, and
+`finish_reason`. The exact assistant response-message shape is
+`role: "assistant"`, `content`, and optional `tool_calls`: `content` is always
+present and is either a string or `null`; `tool_calls` is present only when
+nonempty and uses the assistant tool-call shape above. The response contains no
+provider-specific members. `usage` is omitted when unavailable or invalid,
+never emitted as `null`.
+
+Because v0.1 does not accept a multi-choice request field, every successful
+non-streaming canonical response contains exactly one choice with `index: 0`.
+Every ordinary canonical streaming `ChatChunk` likewise contains exactly one
+choice with `index: 0`; the final gateway-generated usage chunk described below
+is the sole permitted `choices: []` exception. The terminal finish reason
+belongs to choice 0.
+
+An upstream response or ordinary stream chunk with zero choices, multiple
+choices, or any nonzero or duplicate choice index is an `InvalidResponse`.
+For a non-streaming response or an uncommitted stream this is a `TargetError`
+and routing may advance to the next target. If it occurs after streaming
+commitment, the gateway closes the stream without fallback under §4.
+
+Canonical `usage` contains exactly three nonnegative integers:
+`prompt_tokens`, `completion_tokens`, and `total_tokens`. Adapters map native
+input or prompt counts to `prompt_tokens` and native output or candidate counts
+to `completion_tokens`. `total_tokens` is their checked sum; overflow makes the
+usage data invalid. Both component counts must be present and valid before the
+gateway includes usage. If either is absent, non-integer, negative, or otherwise
+invalid, the gateway omits the complete usage object and logs the condition
+safely at debug level without failing an otherwise valid completion.
+Provider-specific usage detail fields are not exposed in the canonical body.
 
 Response metadata is gateway-owned. For each successful selected attempt, the
 gateway generates one opaque unique ID beginning with `chatcmpl-` and one
@@ -417,10 +559,32 @@ Streaming produces OpenAI-shaped chat completion chunks with role, content,
 and tool-call deltas, a final finish reason, and exactly one `data: [DONE]` on
 a successful stream. A successful stream must yield at least one valid
 canonical `ChatChunk` before its terminal signal; terminal-only output is not
-a successful empty response. When `stream_options.include_usage` is true, emit
-a final canonical usage chunk if the selected provider reports streaming usage;
-otherwise finish normally without estimating or inventing usage. Other
-`stream_options` members are rejected.
+a successful empty response. When `stream_options.include_usage` is true and
+valid component counts are available, the gateway emits exactly one final
+usage chunk immediately before `data: [DONE]`. This chunk repeats the stream's
+gateway-owned `id`, `object`, `created`, and `model`, and contains exactly
+`choices: []` plus the canonical `usage` object. When usage was not requested
+or valid component counts are unavailable, the gateway emits no usage chunk
+and completes normally; absent or malformed provider usage never terminates an
+otherwise valid stream. Other `stream_options` members are rejected.
+
+Every ordinary chunk contains exactly `id`, `object`, `created`, `model`, and
+one choice with exactly `index`, `delta`, and `finish_reason`. `finish_reason`
+is `null` on nonterminal chunks and one normalized value on the sole terminal
+chunk. The first ordinary chunk must include `delta.role: "assistant"`; an
+adapter synthesizes it when the native protocol does not. A delta may otherwise
+contain string `content` and/or nonempty `tool_calls`. Empty native events that
+would produce none of these members are ignored.
+
+A streaming tool-call delta contains `index` and may contain `id`,
+`type: "function"`, or a `function` object containing partial string `name`
+and/or `arguments`. Indices start at zero, are introduced in increasing order,
+and identify one call for the life of the stream. The adapter assembles each
+call internally while forwarding deltas, rejects a changed ID or name, and at
+the terminal chunk verifies that every call has a nonempty ID, a declared tool
+name, and a complete native argument value. Exactly one terminal chunk is
+required; an ordinary chunk after it, a second terminal chunk, or `[DONE]`
+before it is an invalid stream.
 
 Final finish reasons are normalized to four OpenAI-shaped values: normal end or
 stop-sequence completion becomes `stop`, an output limit becomes `length`, tool
@@ -491,10 +655,11 @@ The upstream HTTP client must not follow redirects. Any 3xx response becomes a
 an unexpected host. Configured base URLs must point directly at the intended API
 endpoint family.
 
-The gateway owns the client-visible error contract. Gateway validation errors
-return 400, expiration of the request-body deadline returns 408, a request body
-larger than 1 MiB returns 413, an unknown requested model returns 404,
-process-wide concurrency exhaustion returns 503, and expiration of
+The gateway owns the client-visible error contract. Unsupported or malformed
+inbound media types return 415, malformed JSON returns 400, gateway validation
+errors return 400, expiration of the request-body deadline returns 408, a
+request body larger than 1 MiB returns 413, an unknown requested model returns
+404, process-wide concurrency exhaustion returns 503, and expiration of
 `overall_timeout` returns 504. If every route entry fails before that deadline,
 return a 502 error with a stable gateway message.
 
@@ -514,11 +679,13 @@ gateway-owned condition code from this mapping:
 | Condition | HTTP status | `type` | `code` | `param` |
 |-----------|-------------|--------|--------|---------|
 | Request validation failure | 400 | `invalid_request_error` | `invalid_request` | offending top-level field, or `null` |
+| Invalid UTF-8, malformed or non-object JSON, or trailing non-whitespace data | 400 | `invalid_request_error` | `invalid_json` | `null` |
 | Authentication failure | 401 | `authentication_error` | `authentication_failed` | `null` |
 | Unknown requested model | 404 | `not_found_error` | `model_not_found` | `model` |
 | Unknown or unimplemented `/v1/*` route | 404 | `not_found_error` | `route_not_found` | `null` |
 | Request body is not completely buffered within 30 seconds of generation-permit acquisition | 408 | `invalid_request_error` | `request_body_timeout` | `null` |
 | Request body exceeds 1 MiB | 413 | `invalid_request_error` | `request_too_large` | `null` |
+| Missing, repeated, comma-combined, malformed, or unsupported `Content-Type` | 415 | `invalid_request_error` | `unsupported_media_type` | `null` |
 | All route entries fail | 502 | `server_error` | `upstream_exhausted` | `null` |
 | Concurrency capacity exhausted | 503 | `server_error` | `capacity_exhausted` | `null` |
 | `overall_timeout` expires | 504 | `server_error` | `overall_timeout` | `null` |
@@ -551,6 +718,13 @@ parsing, and validation time do not consume this budget. It covers the fallback
 chain only until a response is committed. Each pre-commit attempt is clipped to
 the time remaining in that overall deadline. There is no total generation-
 duration timeout for a stream that continues making progress.
+
+Only an emitted canonical chunk resets the committed-stream idle timer. Native
+keepalives, comments, metadata, usage-only events, and other events consumed
+internally by an adapter do not reset it. Time spent decoding and validating an
+event is part of the same idle interval. Before commitment, the effective
+attempt deadline is `min(request_timeout, remaining overall_timeout)`; if both
+expire simultaneously, `overall_timeout` wins the public error classification.
 
 The gateway cancels the active upstream request when the downstream client
 disconnects and does not continue falling back. Fallback can cause more than one
@@ -608,6 +782,17 @@ limited to 1 MiB. Exceeding the limit before commitment is a `TargetError` and
 may fall back; after commitment it closes the stream. Total stream bytes are not
 capped because the response is processed incrementally.
 
+Native usage-only events are adapter metadata, not ordinary canonical chunks.
+In particular, an OpenAI-compatible upstream `choices: []` usage event is
+consumed by the adapter and retained for the optional gateway-generated usage
+chunk; it is not subjected to the ordinary zero-choice rejection rule and is
+never forwarded directly. Any other zero-choice native event is ignored only
+when the adapter specification identifies it as metadata; otherwise it is an
+`InvalidResponse`. On success, the downstream response uses status 200 and
+headers `Content-Type: text/event-stream` and `Cache-Control: no-cache`; each
+canonical chunk is encoded as one `data: <compact-json>\n\n` event and success
+ends with exactly `data: [DONE]\n\n`.
+
 ### 4.3 Non-streaming requests
 
 The gateway buffers and validates the full response before returning it. A
@@ -619,6 +804,41 @@ is limited to 8 MiB; exceeding that fixed limit is a `TargetError`.
 ---
 
 ## 5. Provider Adapters — Notes Per Provider
+
+### 5.1 Normative translation contract
+
+Adapters preserve conversational order and content bytes; they may regroup
+adjacent canonical messages into native content blocks only when the provider
+wire format requires it. Regrouping inserts no separator text, role label, or
+synthetic conversational content. A provider-specific inability to represent a
+request that passed the route-level rules is an adapter defect, not permission
+to silently omit a field.
+
+| Canonical concept | OpenAI-compatible family | Anthropic | Gemini |
+|-------------------|---------------------------|-----------|--------|
+| Combined leading instructions | One leading `system` message | Top-level `system` string | `systemInstruction` text part |
+| User text | `user` message | User text content block | `user` text part |
+| Assistant text | `assistant` message | Assistant text content block | `model` text part |
+| Assistant tool call | OpenAI `tool_calls` unchanged | Assistant `tool_use` block | Model `functionCall` part |
+| Tool result | `tool` message keyed by `tool_call_id` | User `tool_result` block keyed by native call ID | User `functionResponse` part keyed by function name |
+| `auto` / `none` / `required` / named choice | Native equivalent | Native equivalent | Native equivalent |
+| `max_tokens` | Provider's supported OpenAI-compatible output-token field | `max_tokens` | Native maximum-output-token field |
+| `stop` | `stop` scalar/list as supported by the shared wire family | Native stop-sequence list | Native stop-sequence list |
+| `temperature`, `top_p` | Same-named fields | Same semantic native fields | Same semantic native fields |
+
+For a Gemini tool result, the adapter resolves the canonical `tool_call_id` to
+the function name recorded on the immediately preceding assistant call. If a
+native provider response has a tool call but no stable call ID, the adapter
+generates one opaque ID beginning with `call_`, uses the same ID for all deltas
+of that call, and exposes it in the final canonical history. Native IDs are
+preserved when present and valid. Generated IDs carry no provider meaning and
+need only be unique within the response.
+
+Adapters must have conformance tests for every row above in both request and
+response directions, including multiple tool calls and multiple results in
+non-call order. Provider request-field names and native event names belong to
+the adapter implementation and its tests; they do not leak through the
+canonical interface.
 
 - **OpenAI-compatible family**: one near-passthrough adapter serves `openai/`,
   `mistral/`, `deepseek/`, and `openai_compatible/`. Canonical format is the
@@ -673,36 +893,71 @@ nano-llm --config <path> [--bind <address>] [--no-auth] [--validate]
 
 ### 6.2 Endpoints
 
+For `POST /v1/chat/completions`, after successful inbound authentication and
+before generation-permit acquisition or body buffering, the gateway requires
+exactly one `Content-Type` header. Its media type is matched
+ASCII-case-insensitively to `application/json`. The only permitted parameter is
+a single `charset=utf-8`, whose name and value are also matched
+ASCII-case-insensitively. An absent, repeated, comma-combined, malformed, or
+unsupported value returns the canonical HTTP 415 `unsupported_media_type`
+error with `type: invalid_request_error` and `param: null`, without route lookup,
+permit acquisition, body buffering, or provider work.
+
 Request bodies are limited to a fixed 1 MiB in v0.1. After inbound
-authentication and generation-permit acquisition, the gateway races complete
-body buffering against a fixed 30-second deadline and the 1 MiB limit. The
-first violation determines the response. If the deadline expires first, the
-gateway stops reading the body, releases the generation permit, and returns an
-HTTP 408 error with `type: invalid_request_error`, `code:
-request_body_timeout`, and `param: null`. Neither limit is configurable. JSON
-parsing and canonical validation begin only after the complete body is
-buffered; `overall_timeout` starts only after both succeed.
+authentication, `Content-Type` validation, and generation-permit acquisition,
+the gateway races complete body buffering against a fixed 30-second deadline
+and the 1 MiB limit. The first violation determines the response. If the
+deadline expires first, the gateway stops reading the body, releases the
+generation permit, and returns an HTTP 408 error with `type:
+invalid_request_error`, `code: request_body_timeout`, and `param: null`.
+Neither limit is configurable. After the complete body is buffered, it must
+decode as UTF-8 and contain exactly one JSON object with no trailing
+non-whitespace data. Invalid UTF-8, malformed JSON, a non-object top-level
+value, or trailing non-whitespace data returns the canonical HTTP 400
+`invalid_json` error with `type: invalid_request_error` and `param: null`,
+releases the generation permit, and performs no route lookup or provider work.
+Canonical validation then begins; `overall_timeout` starts only after parsing
+and canonical validation both succeed.
 
 The process also enforces `general_settings.max_in_flight`, default 64, with a
-single semaphore applied only to `POST /v1/chat/completions` and acquired before
-buffering the request body. One generation request holds one permit for its
-whole lifetime, including fallback attempts and streaming. If no permit is
-immediately available, return an OpenAI-shaped 503; v0.1 does not maintain an
-internal waiting queue. `/health` and `/v1/models` bypass this semaphore so they
-remain available during generation saturation. This is a resource guard, not a
+single semaphore constructed only from the load-time validated value. It is
+applied only to `POST /v1/chat/completions` and acquired before buffering the
+request body. One generation request holds one permit for its whole lifetime,
+including fallback attempts and streaming. If no permit is immediately
+available, return an OpenAI-shaped 503; v0.1 does not maintain an internal
+waiting queue. `/health` and `/v1/models` bypass this semaphore so they remain
+available during generation saturation. This is a resource guard, not a
 per-key quota or rate limiter.
 
-For every request, accept `x-request-id` only when it contains 1–128 printable
-ASCII characters with no whitespace or control characters; otherwise generate
-a UUID. Return the chosen value in the `x-request-id` response header and attach
-it to every log record for that request. The gateway request ID is not forwarded
-upstream in v0.1.
+For every inbound request, the gateway selects the request ID at the start of
+application handling, before authentication or any other application
+processing, so early failures receive the same correlation behavior.
+
+A client value is accepted only when exactly one raw `x-request-id` field is
+present and its value is 1–128 bytes, all in the ASCII range `0x21`–`0x7E`
+inclusive. The gateway preserves accepted bytes exactly, without trimming,
+normalization, or comma splitting; a comma contained in the single header
+field is therefore a literal permitted character, not list syntax. When the
+ID is absent, repeated, or invalid, the gateway generates a lowercase
+canonical UUIDv4 string and never echoes any rejected value.
+
+The gateway attaches the chosen ID to every log record for the request and sets
+exactly one `x-request-id` response header on every application response,
+including health, authentication, validation, routing, and other error
+responses. The gateway request ID is not forwarded upstream in v0.1.
 
 | Endpoint                  | Behavior                                                   |
 |----------------------------|--------------------------------------------------------------|
 | `POST /v1/chat/completions`| Main entry point. `model` field in body selects the group.  |
 | `GET /health`              | Liveness only — does NOT check upstream provider health (no circuit breaker state to report). |
 | `GET /v1/models`           | Lists configured model-group names in the OpenAI models-list envelope. |
+
+Only the method/path pairs in this table are registered. Any other method on a
+listed path, and any other path, returns 404 rather than 405. Under `/v1/*` it
+uses the canonical `route_not_found` envelope and is authenticated before route
+resolution. Outside `/v1/*`, including a method mismatch on `/health`, it
+returns that same envelope without authentication. All such responses still
+carry the selected `x-request-id`.
 
 Whenever the process can serve HTTP, `GET /health` returns HTTP 200 with
 `Content-Type: application/json` and the exact body `{"status":"ok"}`. It
@@ -722,11 +977,20 @@ Entries are ordered by the first appearance of each `model_name` in
 404. Adding either later requires its own canonical request/response types and
 provider support matrix; it must not be squeezed through the chat interface.
 
-Auth: `Authorization: Bearer <master_key>` is required on all `/v1/*` routes
-and compared without leaking timing information. Reject with 401 before any
-routing/provider work happens. `/health` is deliberately unauthenticated so a
-local supervisor or container runtime can perform a liveness check. `--no-auth`
-is for local development only and refuses to bind to a non-loopback address.
+When authentication is enabled, every `/v1/*` request must contain exactly one
+`Authorization` header field. Its authentication scheme is matched
+ASCII-case-insensitively to `Bearer` and must be followed by exactly one ASCII
+space (`0x20`). Every byte after that delimiter is the credential and is
+compared exactly, without trimming or normalization, to `master_key` using a
+constant-time equality operation.
+
+Absent, repeated, comma-combined, malformed, non-Bearer, and mismatched values
+all return the same 401 `authentication_failed` envelope before route lookup,
+generation-permit acquisition, body buffering, or provider work. Under
+`--no-auth`, the gateway skips the authentication check entirely. `/health`
+is always unauthenticated so a local supervisor or container runtime can
+perform a liveness check. `--no-auth` remains restricted to loopback bind
+addresses.
 
 ---
 
@@ -779,6 +1043,9 @@ The two `fast` entries form one fallback route in file order.
 
 ## 9. Decisions for v0.1
 
+- **Release boundary:** v0.1 means the complete surface in this document. The
+  milestones are development slices, not smaller conforming releases; partial
+  builds identify themselves as development builds.
 - **Product boundary:** nano-llm serves a single operator or small trusted team
   needing a self-hosted reliability shim across a handful of providers. It is
   deliberately not an organization-wide AI platform. One process, one config
@@ -810,6 +1077,11 @@ The two `fast` entries form one fallback route in file order.
   loaded and validated once at startup, then remain immutable for the process
   lifetime. v0.1 has no SIGHUP or API-driven reload; applying changes requires
   a process restart.
+- **YAML subset:** accept exactly one document with string mapping keys and
+  reject custom tags, aliases, anchors, merge keys, and duplicate keys.
+  Environment-reference syntax is active only in `master_key` and `api_key`.
+  Under `--no-auth`, `general_settings` may be omitted; configured values are
+  still validated even when authentication is disabled.
 - **CLI:** the process exposes only `--config`, `--bind`, `--validate`, and
   `--no-auth`. The config path is required, bind defaults to
   `127.0.0.1:4000`, validation exits before serving, and no routing or provider
@@ -857,7 +1129,9 @@ The two `fast` entries form one fallback route in file order.
 - **Streaming usage:** `stream_options.include_usage` is supported as a
   best-effort passthrough. If requested, a final usage chunk is emitted only
   when the selected provider supplies streaming usage; missing values are not
-  estimated. All other `stream_options` fields are rejected.
+  estimated. Native usage-only events are consumed as metadata and only the
+  gateway emits a zero-choice usage chunk. All other `stream_options` fields
+  are rejected.
 - **Tool-choice boundary:** `tools`, when present, is nonempty. `tool_choice`
   is rejected when `tools` is absent. Omission normalizes to `auto` with tools
   and `none` without tools. A named choice must match a declared function;
@@ -879,11 +1153,12 @@ The two `fast` entries form one fallback route in file order.
   arrive in any order but must resolve each immediately preceding call exactly
   once before conversation continues. Invalid transcripts return 400 before
   routing.
-- **Tool arguments:** canonical `function.arguments` is an opaque string, not a
-  gateway-validated JSON object. OpenAI-compatible paths preserve it exactly;
-  adapters that require an object parse it locally, and parse failure is a
-  target error. Malformed model-generated argument JSON is not globally treated
-  as an invalid successful response.
+- **Tool arguments:** model-generated canonical `function.arguments` is an
+  opaque string and malformed JSON is not globally treated as an invalid
+  successful OpenAI-compatible response. In inbound history, routes containing
+  Anthropic or Gemini require every argument string to parse as exactly one JSON
+  object during gateway validation; other routes preserve it opaquely. This
+  route-level rule ensures every configured fallback can represent the request.
 - **Attempt policy:** each configured route entry is attempted at most once.
   Every target error advances immediately; canonical validation errors stop
   before routing. Repeating a target in configuration is the explicit way to
@@ -949,18 +1224,31 @@ The two `fast` entries form one fallback route in file order.
   OpenAI-compatible adapter may omit its key entirely.
 - **Provider seam:** adapters receive one validated canonical `ChatRequest` and
   return a canonical `ChatResponse` or `ChatChunk` stream. Routing does not know
-  provider authentication, URLs, or wire formats.
+  provider authentication, URLs, or wire formats. The exact canonical nested
+  shapes and translation table in §3.2 and §5.1 are part of this interface,
+  not adapter discretion.
 - **Streaming commitment:** no downstream status, headers, or body are sent
   until the first canonical chunk is valid. A successful stream requires at
   least one canonical chunk before its terminal signal. A terminal signal
   received first is an `InvalidResponse` `TargetError`; while the response is
   uncommitted, routing advances to the next target. After commitment, any
-  upstream failure closes the stream and never triggers fallback.
+  upstream failure closes the stream and never triggers fallback. Only emitted
+  canonical chunks reset the post-commit idle timer; native keepalives and
+  metadata do not.
+- **HTTP method handling:** only the three documented method/path pairs are
+  registered. Every other path or method returns 404, not 405. `/v1/*` failures
+  authenticate first and use `route_not_found`; non-v1 failures use the same
+  envelope without authentication.
 - **Logging:** use `tracing` and `tracing-subscriber` to write structured fields
-  to stdout. Log one completion record per inbound request with its validated or
-  generated request ID, requested model, selected provider/model, attempt count,
-  outcome, status code, and elapsed milliseconds. Log failed attempts at debug
-  level and the exhausted/fatal result at warn level. Never log request or
+  to stdout. Log one request-completion record per application request with its
+  validated or generated request ID, outcome, status code, and elapsed
+  milliseconds. Requested model, selected provider/model, and attempt count are
+  nullable when processing did not reach those stages. Stream outcomes are
+  `completed`, `client_disconnected`, or `upstream_failed_after_commit`; the
+  latter two retain HTTP status 200 in the record when headers were already
+  committed. Non-streaming outcome names use the stable gateway condition code
+  or `completed`. Log failed attempts at debug level and the exhausted/fatal
+  result at warn level. Never log request or
   response bodies, API keys, authorization headers, access tokens, or credential
   contents. Human-readable output is the only v0.1 formatter; JSON formatting,
   telemetry exporters, log storage, and analytics are out of scope.

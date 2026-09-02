@@ -1,0 +1,46 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+secrets/
+*.secret
+
+# Coverage and profiling output
+coverage/
+*.lcov
+*.profraw
+*.profdata
+cobertura.xml
+lcov.info
+tarpaulin-report/
+
+# Editor and IDE configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+.claude/
+*.sublime-project
+*.sublime-workspace
+
+# OS metadata
+.DS_Store
+Thumbs.db
+._*
+desktop.ini
+
+# Task cache
+.task/

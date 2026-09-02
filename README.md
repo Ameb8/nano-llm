@@ -100,3 +100,15 @@ curl http://localhost:8080/v1/chat/completions \
 | `POST /v1/embeddings` | Text embeddings |
 | `GET /health` | Gateway liveness check |
 | `GET /v1/models` | List configured models |
+
+---
+
+## Development & Quality Workflow
+
+`nano-llm` uses [Task](https://taskfile.dev) as the canonical interface for formatting, linting, tests, and aggregate quality checks. Implementing coding agents and contributors must run relevant Taskfile targets (specifically `task check`) before handoff.
+
+- `task format` — formats Rust source code (`cargo fmt --all`)
+- `task lint` — runs Clippy with warnings treated as errors (`cargo clippy --all-targets --all-features -- -D warnings`)
+- `task test` — executes the automated test suite (`cargo test --all-targets --all-features`)
+- `task check` — runs format verification, linting, and tests; fails if any constituent check fails
+

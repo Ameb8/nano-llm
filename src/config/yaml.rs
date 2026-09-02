@@ -139,10 +139,7 @@ impl<'a> YamlStream<'a> {
                         message: info.to_string(),
                     }
                 };
-                Err(ConfigError::new(
-                    kind,
-                    Some(marker_to_location(marker)),
-                ))
+                Err(ConfigError::new(kind, Some(marker_to_location(marker))))
             }
             None => Ok(None),
         }
@@ -210,21 +207,12 @@ pub fn parse_spanned_node(yaml: &str) -> Result<SpannedNode, ConfigError> {
     };
 
     // Check for any subsequent documents
-    loop {
-        match stream.next()? {
-            Some((Event::StreamEnd, _)) | None => break,
-            Some((Event::DocumentStart(_), span)) => {
-                return Err(ConfigError::new(
-                    ConfigErrorKind::MultipleDocuments,
-                    Some(marker_to_location(&span.start)),
-                ));
-            }
-            Some((_, span)) => {
-                return Err(ConfigError::new(
-                    ConfigErrorKind::MultipleDocuments,
-                    Some(marker_to_location(&span.start)),
-                ));
-            }
+    if let Some((event, span)) = stream.next()? {
+        if event != Event::StreamEnd {
+            return Err(ConfigError::new(
+                ConfigErrorKind::MultipleDocuments,
+                Some(marker_to_location(&span.start)),
+            ));
         }
     }
 
@@ -589,10 +577,7 @@ fn parse_model_entry(node: &SpannedNode, path: &str) -> Result<RawModelEntry, Co
     })
 }
 
-fn parse_litellm_params(
-    node: &SpannedNode,
-    path: &str,
-) -> Result<RawLiteLlmParams, ConfigError> {
+fn parse_litellm_params(node: &SpannedNode, path: &str) -> Result<RawLiteLlmParams, ConfigError> {
     let entries = match node {
         SpannedNode::Mapping { entries, .. } => entries,
         _ => {
@@ -749,16 +734,11 @@ fn parse_string(node: &SpannedNode, path: &str) -> Result<String, ConfigError> {
     }
 }
 
-fn parse_optional_string(
-    node: &SpannedNode,
-    path: &str,
-) -> Result<Option<String>, ConfigError> {
+fn parse_optional_string(node: &SpannedNode, path: &str) -> Result<Option<String>, ConfigError> {
     match node {
         SpannedNode::Scalar { value, style, .. } => {
             if *style == ScalarStyle::Plain
-                && (value == "~"
-                    || value.eq_ignore_ascii_case("null")
-                    || value.is_empty())
+                && (value == "~" || value.eq_ignore_ascii_case("null") || value.is_empty())
             {
                 Ok(None)
             } else if *style == ScalarStyle::Plain && is_plain_non_string(value).is_some() {
@@ -786,16 +766,11 @@ fn parse_optional_string(
     }
 }
 
-fn parse_optional_number(
-    node: &SpannedNode,
-    path: &str,
-) -> Result<Option<f64>, ConfigError> {
+fn parse_optional_number(node: &SpannedNode, path: &str) -> Result<Option<f64>, ConfigError> {
     match node {
         SpannedNode::Scalar { value, style, .. } => {
             if *style == ScalarStyle::Plain
-                && (value == "~"
-                    || value.eq_ignore_ascii_case("null")
-                    || value.is_empty())
+                && (value == "~" || value.eq_ignore_ascii_case("null") || value.is_empty())
             {
                 Ok(None)
             } else if let Ok(num) = value.parse::<f64>() {
@@ -833,16 +808,11 @@ fn parse_optional_number(
     }
 }
 
-fn parse_optional_integer(
-    node: &SpannedNode,
-    path: &str,
-) -> Result<Option<usize>, ConfigError> {
+fn parse_optional_integer(node: &SpannedNode, path: &str) -> Result<Option<usize>, ConfigError> {
     match node {
         SpannedNode::Scalar { value, style, .. } => {
             if *style == ScalarStyle::Plain
-                && (value == "~"
-                    || value.eq_ignore_ascii_case("null")
-                    || value.is_empty())
+                && (value == "~" || value.eq_ignore_ascii_case("null") || value.is_empty())
             {
                 Ok(None)
             } else if let Ok(num) = value.parse::<usize>() {

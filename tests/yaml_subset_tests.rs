@@ -56,7 +56,10 @@ general_settings:
     let config = parse_yaml_str(yaml).expect("should parse valid full config");
     assert_eq!(config.model_list.len(), 3);
     assert_eq!(config.model_list[0].model_name, "fast");
-    assert_eq!(config.model_list[0].litellm_params.model, "mistral/mistral-small-latest");
+    assert_eq!(
+        config.model_list[0].litellm_params.model,
+        "mistral/mistral-small-latest"
+    );
     assert_eq!(
         config.model_list[0].litellm_params.api_key.as_deref(),
         Some("os.environ/MISTRAL_API_KEY")
@@ -68,7 +71,10 @@ general_settings:
     assert_eq!(config.model_list[0].litellm_params.timeout, Some(15.5));
 
     assert_eq!(config.model_list[1].model_name, "fast");
-    assert_eq!(config.model_list[1].litellm_params.model, "gemini/gemini-2.5-flash");
+    assert_eq!(
+        config.model_list[1].litellm_params.model,
+        "gemini/gemini-2.5-flash"
+    );
     assert_eq!(config.model_list[1].litellm_params.timeout, Some(20.0));
 
     assert_eq!(config.model_list[2].model_name, "quality");

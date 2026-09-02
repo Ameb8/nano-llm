@@ -109,3 +109,14 @@ For streaming requests, nano-llm can fall back until it has sent the first canon
 `/v1/completions` and `/v1/embeddings` are not implemented in v0.1. Other paths and unsupported methods return 404.
 
 All `/v1/*` errors use an OpenAI-shaped JSON envelope. The gateway never forwards upstream error bodies or credentials to clients. Responses include an `x-request-id` header for correlation.
+
+---
+
+## Development & Quality Workflow
+
+`nano-llm` uses [Task](https://taskfile.dev) as the canonical interface for formatting, linting, tests, and aggregate quality checks. Implementing coding agents and contributors must run relevant Taskfile targets (specifically `task check`) before handoff.
+
+- `task format` — formats Rust source code (`cargo fmt --all`)
+- `task lint` — runs Clippy with warnings treated as errors (`cargo clippy --all-targets --all-features -- -D warnings`)
+- `task test` — executes the automated test suite (`cargo test --all-targets --all-features`)
+- `task check` — runs format verification, linting, and tests; fails if any constituent check fails

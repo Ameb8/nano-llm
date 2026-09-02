@@ -1,0 +1,40 @@
+version: '3'
+
+# nano-llm Taskfile
+#
+# Canonical quality workflow for nano-llm.
+# Implementing coding agents must run `task check` (or relevant targets:
+# `task format`, `task lint`, `task test`) before handoff.
+
+tasks:
+  default:
+    desc: Run canonical quality check workflow
+    cmds:
+      - task: check
+
+  format:
+    desc: Format Rust source code
+    cmds:
+      - cargo fmt --all
+
+  format-check:
+    desc: Verify Rust source code formatting without modifying files
+    cmds:
+      - cargo fmt --all -- --check
+
+  lint:
+    desc: Run Clippy lints with warnings treated as errors
+    cmds:
+      - cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    desc: Run automated test suite
+    cmds:
+      - cargo test --all-targets --all-features
+
+  check:
+    desc: Canonical quality check (format verification, linting, and tests)
+    cmds:
+      - task: format-check
+      - task: lint
+      - task: test

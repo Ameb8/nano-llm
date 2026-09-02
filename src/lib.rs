@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod config;
 
 pub use cli::{Cli, CliError, DEFAULT_BIND_ADDR, IS_DEV_BUILD};
 

@@ -7,3 +7,4 @@ readme = "README.md"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+saphyr-parser = "0.0.12"

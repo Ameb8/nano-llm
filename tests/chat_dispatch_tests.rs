@@ -526,6 +526,21 @@ fn canonical_chunk(content: &str) -> ChatChunk {
     }
 }
 
+fn terminal_chunk() -> ChatChunk {
+    ChatChunk {
+        id: "stream-id".into(),
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "public".into(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: AssistantDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+        }],
+        usage: None,
+    }
+}
+
 #[test]
 fn streaming_buffers_the_first_canonical_chunk_then_fails_over_once_per_precommit_error() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -535,7 +550,7 @@ fn streaming_buffers_the_first_canonical_chunk_then_fails_over_once_per_precommi
         // by an exhausted canonical iterator.
         StreamOutcome::Events(vec![]),
         StreamOutcome::Events(vec![Err(TargetError::invalid_response())]),
-        StreamOutcome::Events(vec![Ok(canonical_chunk("chosen"))]),
+        StreamOutcome::Events(vec![Ok(canonical_chunk("chosen")), Ok(terminal_chunk())]),
     ];
     let targets = (0..outcomes.len())
         .map(|index| target(&format!("entry-{index}")))
@@ -580,6 +595,167 @@ fn streaming_buffers_the_first_canonical_chunk_then_fails_over_once_per_precommi
     assert_eq!(
         *seen.lock().unwrap(),
         vec!["entry-0", "entry-1", "entry-2", "entry-3"]
+    );
+}
+
+#[test]
+fn committed_stream_failure_never_falls_back_or_invents_done() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("locked"), target("must-not-start")],
+        }],
+    };
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new({
+            let seen = seen.clone();
+            move |target| {
+                seen.lock().unwrap().push(target.model_suffix.clone());
+                if target.model_suffix == "locked" {
+                    Box::new(SequencedStreamProvider(StreamOutcome::Events(vec![
+                        Ok(canonical_chunk("partial")),
+                        Err(TargetError::connection()),
+                    ])))
+                } else {
+                    Box::new(SequencedStreamProvider(StreamOutcome::Events(vec![
+                        Ok(canonical_chunk("wrong-provider")),
+                        Ok(terminal_chunk()),
+                    ])))
+                }
+            }
+        }),
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    assert_eq!(response.status, 200);
+    assert_eq!(*seen.lock().unwrap(), vec!["locked"]);
+    assert!(std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("partial"));
+    assert!(!response.body.ends_with(b"data: [DONE]\n\n"));
+}
+
+#[test]
+fn committed_stream_without_terminal_closes_without_done() {
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("only")],
+        }],
+    };
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new(|_| {
+            Box::new(SequencedStreamProvider(StreamOutcome::Events(vec![Ok(
+                canonical_chunk("partial"),
+            )])))
+        }),
+    );
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    assert_eq!(response.status, 200);
+    assert!(!response.body.ends_with(b"data: [DONE]\n\n"));
+}
+
+#[test]
+fn post_commit_disconnect_drops_stream_and_releases_generation_permit() {
+    struct CancelOnNext {
+        cancellation: nano_llm::DownstreamCancellation,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Iterator for CancelOnNext {
+        type Item = Result<ChatChunk, TargetError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.cancellation.cancel();
+            Some(Ok(terminal_chunk()))
+        }
+    }
+    impl Drop for CancelOnNext {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    struct DisconnectProvider {
+        cancellation: nano_llm::DownstreamCancellation,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Provider for DisconnectProvider {
+        fn complete<'a>(
+            &'a self,
+            _request: &'a CanonicalRequest,
+        ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+            Box::pin(async { Ok(successful_response(FinishReason::Stop)) })
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _request: &'a CanonicalRequest,
+        ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+            let stream = CancelOnNext {
+                cancellation: self.cancellation.clone(),
+                dropped: self.dropped.clone(),
+            };
+            Box::pin(async move {
+                Ok(
+                    Box::new(std::iter::once(Ok(canonical_chunk("first"))).chain(stream))
+                        as ProviderStream,
+                )
+            })
+        }
+    }
+    let cancellation = nano_llm::DownstreamCancellation::default();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            max_in_flight: 1,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("only")],
+        }],
+    };
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new({
+            let cancellation = cancellation.clone();
+            let dropped = dropped.clone();
+            move |_| {
+                Box::new(DisconnectProvider {
+                    cancellation: cancellation.clone(),
+                    dropped: dropped.clone(),
+                })
+            }
+        }),
+    );
+    let response = application.handle(
+        &chat(
+            br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        )
+        .with_downstream_cancellation(cancellation),
+    );
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(!response.body.ends_with(b"data: [DONE]\n\n"));
+    // The materialized response has dropped its permit even though the stream
+    // was cancelled after the 200 commitment.
+    assert_eq!(
+        application
+            .handle(&chat(
+                br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .status,
+        200
     );
 }
 
@@ -754,6 +930,141 @@ impl nano_llm::MonotonicClock for PausedClock {
     fn now(&self) -> Duration {
         Duration::from_secs(self.0.load(Ordering::Acquire))
     }
+}
+
+struct TimedPostCommitStream {
+    clock: Arc<PausedClock>,
+    delays: Vec<Duration>,
+    events: Vec<Result<ChatChunk, TargetError>>,
+}
+
+impl Iterator for TimedPostCommitStream {
+    type Item = Result<ChatChunk, TargetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let delay = self.delays.first().copied()?;
+        self.delays.remove(0);
+        self.clock.advance(delay);
+        Some(self.events.remove(0))
+    }
+}
+
+struct TimedPostCommitProvider {
+    clock: Arc<PausedClock>,
+    delays: Vec<Duration>,
+    events: Vec<Result<ChatChunk, TargetError>>,
+}
+
+impl Provider for TimedPostCommitProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        let stream = TimedPostCommitStream {
+            clock: self.clock.clone(),
+            delays: self.delays.clone(),
+            events: self.events.clone(),
+        };
+        Box::pin(async move { Ok(Box::new(stream) as ProviderStream) })
+    }
+}
+
+#[test]
+fn post_commit_idle_deadline_resets_only_when_a_canonical_chunk_is_emitted() {
+    let clock = Arc::new(PausedClock::default());
+    let mut selected = target("timed");
+    selected.timeout = 3;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![selected],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            move |_| {
+                Box::new(TimedPostCommitProvider {
+                    clock: clock.clone(),
+                    // Each ordinary chunk arrives before the 3-second idle
+                    // deadline and resets it; the terminal then completes.
+                    delays: vec![
+                        Duration::ZERO,
+                        Duration::from_secs(2),
+                        Duration::from_secs(2),
+                    ],
+                    events: vec![
+                        Ok(canonical_chunk("first")),
+                        Ok(canonical_chunk("progress")),
+                        Ok(terminal_chunk()),
+                    ],
+                })
+            }
+        }),
+        clock,
+    );
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    let body = std::str::from_utf8(&response.body).unwrap();
+    assert!(body.contains("progress"));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
+
+#[test]
+fn post_commit_idle_timeout_closes_locked_stream_without_done_or_fallback() {
+    let clock = Arc::new(PausedClock::default());
+    let seen = Arc::new(AtomicUsize::new(0));
+    let mut selected = target("timed");
+    selected.timeout = 3;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![selected, target("must-not-start")],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            let seen = seen.clone();
+            move |_| {
+                seen.fetch_add(1, Ordering::AcqRel);
+                Box::new(TimedPostCommitProvider {
+                    clock: clock.clone(),
+                    delays: vec![Duration::ZERO, Duration::from_secs(3)],
+                    events: vec![
+                        Ok(canonical_chunk("first")),
+                        Ok(canonical_chunk("too-late")),
+                    ],
+                })
+            }
+        }),
+        clock,
+    );
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    assert_eq!(seen.load(Ordering::Acquire), 1);
+    assert!(std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("first"));
+    assert!(!std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("too-late"));
+    assert!(!response.body.ends_with(b"data: [DONE]\n\n"));
 }
 
 struct PendingThroughDeadline {

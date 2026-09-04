@@ -202,6 +202,12 @@ pub struct StreamRouteDispatch {
     pub stream: crate::providers::ProviderStream,
     pub attempts: Vec<AttemptRecord>,
     pub diagnostics: RouteDiagnostics,
+    // Commitment ends the route-wide timeout.  These values are retained for
+    // the locked-in stream only: no post-commit outcome can resume routing.
+    idle_timeout: Duration,
+    cancellation: DownstreamCancellation,
+    clock: Arc<dyn MonotonicClock>,
+    include_usage: bool,
 }
 
 /// Safe attempt history when no target produced a response.
@@ -674,7 +680,10 @@ impl Application {
                 continue;
             }
             match first {
-                Some(Ok(first_chunk)) => {
+                Some(Ok(first_chunk))
+                    if StreamSuccessState::first(&first_chunk, request.include_usage).is_some()
+                        && first_chunk.model == request.model =>
+                {
                     attempts.push(AttemptRecord {
                         route_index,
                         provider: provider_kind,
@@ -686,8 +695,18 @@ impl Application {
                         stream,
                         diagnostics: route_diagnostics(request, &attempts),
                         attempts,
+                        idle_timeout: Duration::from_secs(target_timeout),
+                        cancellation: cancellation.clone(),
+                        clock: self.clock.clone(),
+                        include_usage: request.include_usage,
                     });
                 }
+                Some(Ok(_)) => attempts.push(failed_attempt(
+                    route_index,
+                    provider_kind,
+                    target_model,
+                    TargetError::invalid_response(),
+                )),
                 Some(Err(error)) => attempts.push(failed_attempt(
                     route_index,
                     provider_kind,
@@ -1076,22 +1095,62 @@ fn json_response(status: u16, body: String) -> HttpResponse {
 /// incrementally after this commitment point.
 fn sse_response(mut dispatch: StreamRouteDispatch) -> HttpResponse {
     let mut body = String::new();
+    let expected = StreamMetadata::from(&dispatch.first_chunk);
+    let mut state = match StreamSuccessState::first(&dispatch.first_chunk, dispatch.include_usage) {
+        Some(state) => state,
+        // This should be unreachable for adapters, but the HTTP commitment
+        // boundary must remain defensive if an implementation violates the
+        // provider contract.
+        None => return empty_sse_response(),
+    };
     serialize_sse_chunk(&mut body, &dispatch.first_chunk);
-    let mut completed = true;
-    for item in dispatch.stream.by_ref() {
+    // The first chunk is the only event buffered before commitment. Emitting
+    // it starts the post-commit idle interval; metadata and keepalives never
+    // reach this boundary and therefore cannot reset it.
+    let mut idle_deadline = dispatch.clock.now().saturating_add(dispatch.idle_timeout);
+    let mut completed = false;
+    loop {
+        if dispatch.cancellation.is_cancelled() || dispatch.clock.now() >= idle_deadline {
+            break;
+        }
+        let item = dispatch.stream.next();
+        // Decoding can itself consume the idle budget. A chunk obtained after
+        // expiry is not emitted and cannot revive the stream.
+        if dispatch.cancellation.is_cancelled() || dispatch.clock.now() >= idle_deadline {
+            break;
+        }
+        let Some(item) = item else {
+            completed = state.terminal;
+            break;
+        };
         match item {
-            Ok(chunk) => serialize_sse_chunk(&mut body, &chunk),
+            Ok(chunk) if state.accept(&chunk, &expected) => {
+                let ordinary = !chunk.choices.is_empty();
+                serialize_sse_chunk(&mut body, &chunk);
+                // A usage-only chunk is adapter metadata made observable only
+                // at successful completion. It deliberately does not count as
+                // progress for the idle deadline.
+                if ordinary {
+                    idle_deadline = dispatch.clock.now().saturating_add(dispatch.idle_timeout);
+                }
+            }
+            Ok(_) => break,
             // Failures after the first chunk are deliberately not retried and
             // do not receive a gateway-invented terminal event.
-            Err(_) => {
-                completed = false;
-                break;
-            }
+            Err(_) => break,
         }
     }
     if completed {
         body.push_str("data: [DONE]\n\n");
     }
+    empty_sse_response_with_body(body)
+}
+
+fn empty_sse_response() -> HttpResponse {
+    empty_sse_response_with_body(String::new())
+}
+
+fn empty_sse_response_with_body(body: String) -> HttpResponse {
     HttpResponse {
         status: 200,
         headers: vec![
@@ -1099,6 +1158,93 @@ fn sse_response(mut dispatch: StreamRouteDispatch) -> HttpResponse {
             ("cache-control".into(), "no-cache".into()),
         ],
         body: body.into_bytes(),
+    }
+}
+
+#[derive(Clone)]
+struct StreamMetadata {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+}
+
+impl From<&ChatChunk> for StreamMetadata {
+    fn from(chunk: &ChatChunk) -> Self {
+        Self {
+            id: chunk.id.clone(),
+            object: chunk.object,
+            created: chunk.created,
+            model: chunk.model.clone(),
+        }
+    }
+}
+
+/// Final validation immediately before bytes become public. Adapters normally
+/// establish these invariants, but retaining this small gate makes a custom
+/// provider unable to leak inconsistent canonical chunks after commitment.
+struct StreamSuccessState {
+    terminal: bool,
+    usage_seen: bool,
+    include_usage: bool,
+}
+
+impl StreamSuccessState {
+    fn first(chunk: &ChatChunk, include_usage: bool) -> Option<Self> {
+        let mut state = Self {
+            terminal: false,
+            usage_seen: false,
+            include_usage,
+        };
+        let has_initial_role = matches!(
+            chunk.choices.as_slice(),
+            [choice] if choice.delta.role == Some("assistant")
+        );
+        (has_initial_role && state.accept(chunk, &StreamMetadata::from(chunk))).then_some(state)
+    }
+
+    fn accept(&mut self, chunk: &ChatChunk, metadata: &StreamMetadata) -> bool {
+        if chunk.id != metadata.id
+            || chunk.object != metadata.object
+            || chunk.created != metadata.created
+            || chunk.model != metadata.model
+        {
+            return false;
+        }
+        if chunk.choices.is_empty() {
+            let Some(usage) = &chunk.usage else {
+                return false;
+            };
+            if !self.include_usage
+                || self.usage_seen
+                || !self.terminal
+                || usage.prompt_tokens.checked_add(usage.completion_tokens)
+                    != Some(usage.total_tokens)
+            {
+                return false;
+            }
+            self.usage_seen = true;
+            return true;
+        }
+        if self.terminal || chunk.usage.is_some() || chunk.choices.len() != 1 {
+            return false;
+        }
+        let choice = &chunk.choices[0];
+        if choice.index != 0 {
+            return false;
+        }
+        let has_delta = choice.delta.role.is_some()
+            || choice.delta.content.is_some()
+            || !choice.delta.tool_calls.is_empty();
+        if (!has_delta && choice.finish_reason.is_none())
+            || matches!(choice.delta.role, Some(role) if role != "assistant")
+        {
+            return false;
+        }
+        if choice.finish_reason.is_some() {
+            self.terminal = true;
+        }
+        true
     }
 }
 

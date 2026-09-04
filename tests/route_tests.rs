@@ -114,6 +114,34 @@ general_settings:
 }
 
 #[test]
+fn test_global_and_per_target_attempt_timeouts_are_resolved() {
+    let yaml = r#"
+model_list:
+  - model_name: default
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OAI_KEY
+  - model_name: default
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OAI_KEY
+      timeout: 9
+general_settings:
+  master_key: os.environ/M_KEY
+  request_timeout: 17
+  overall_timeout: 41
+"#;
+
+    let runtime = build_runtime_config(parse_yaml_str(yaml).unwrap(), false, &mock_env()).unwrap();
+    assert_eq!(runtime.general_settings.request_timeout, 17);
+    assert_eq!(runtime.general_settings.overall_timeout, 41);
+    assert_eq!(runtime.routes[0].targets[0].timeout, 17);
+    assert_eq!(runtime.routes[0].targets[0].explicit_timeout, None);
+    assert_eq!(runtime.routes[0].targets[1].timeout, 9);
+    assert_eq!(runtime.routes[0].targets[1].explicit_timeout, Some(9));
+}
+
+#[test]
 fn test_provider_presets_and_keyless_custom_target_matrix() {
     let env = mock_env();
     let yaml = r#"

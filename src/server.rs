@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -179,6 +179,34 @@ pub struct RouteDispatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteExhausted {
     pub attempts: Vec<AttemptRecord>,
+    /// True when the route-wide deadline elapsed. In that case no later
+    /// target was started, even if entries remain in the configured route.
+    pub overall_timeout: bool,
+}
+
+/// Source of monotonic time used by pre-commit routing deadlines. Keeping this
+/// as a narrow application seam permits deterministic deadline tests without
+/// coupling the router to an async runtime.
+pub trait MonotonicClock: Send + Sync {
+    fn now(&self) -> Duration;
+}
+
+struct SystemClock {
+    origin: Instant,
+}
+
+impl SystemClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl MonotonicClock for SystemClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
 }
 
 impl GatewayError {
@@ -227,6 +255,7 @@ pub struct Application {
     no_auth: bool,
     generation_capacity: Arc<GenerationCapacity>,
     provider_factory: Arc<ProviderFactory>,
+    clock: Arc<dyn MonotonicClock>,
 }
 
 /// Constructs one target-bound provider after routing has selected its target.
@@ -246,12 +275,30 @@ pub fn app_with_provider_factory(
     no_auth: bool,
     provider_factory: Arc<ProviderFactory>,
 ) -> Application {
+    app_with_provider_factory_and_clock(
+        config,
+        no_auth,
+        provider_factory,
+        Arc::new(SystemClock::new()),
+    )
+}
+
+/// Construct an application with an explicit monotonic clock. Production uses
+/// [`app_with_provider_factory`]; this constructor keeps timing behavior
+/// deterministically testable at the route boundary.
+pub fn app_with_provider_factory_and_clock(
+    config: RuntimeConfig,
+    no_auth: bool,
+    provider_factory: Arc<ProviderFactory>,
+    clock: Arc<dyn MonotonicClock>,
+) -> Application {
     let max_in_flight = config.general_settings.max_in_flight;
     Application {
         config,
         no_auth,
         generation_capacity: Arc::new(GenerationCapacity::new(max_in_flight)),
         provider_factory,
+        clock,
     }
 }
 
@@ -356,8 +403,16 @@ impl Application {
         // The response is materialized by the adapter before this function
         // creates any successful HTTP response, preserving non-streaming
         // commitment semantics.
+        // This is deliberately after complete buffering, JSON parsing, and
+        // canonical route validation: none of that inbound work consumes the
+        // fallback-chain budget.
         match self.dispatch_route(route, &canonical, &request.cancellation) {
             Ok(dispatch) => json_response(200, serialize_chat_response(&dispatch.response)),
+            Err(exhausted) if exhausted.overall_timeout => error_response(GatewayError::new(
+                GatewayErrorKind::OverallTimeout,
+                "Overall request timed out",
+                None,
+            )),
             Err(_) => error_response(GatewayError::new(
                 GatewayErrorKind::UpstreamExhausted,
                 "All configured upstream targets failed",
@@ -375,12 +430,44 @@ impl Application {
         request: &crate::request::CanonicalRequest,
         cancellation: &DownstreamCancellation,
     ) -> Result<RouteDispatch, RouteExhausted> {
+        let overall_deadline = self.clock.now().saturating_add(Duration::from_secs(
+            self.config.general_settings.overall_timeout,
+        ));
         let mut attempts = Vec::with_capacity(route.targets.len());
         for (route_index, target) in route.targets.iter().cloned().enumerate() {
+            let now = self.clock.now();
+            // Equality belongs to the route-wide deadline. Never construct a
+            // provider after it has expired, avoiding a billable invocation.
+            if now >= overall_deadline {
+                return Err(RouteExhausted {
+                    attempts,
+                    overall_timeout: true,
+                });
+            }
             let provider_kind = target.provider;
             let target_model = target.model.clone();
+            let target_timeout = target.timeout;
             let provider = (self.provider_factory)(target);
-            match block_on(provider.complete(request), cancellation) {
+            // Provider construction is deliberately distinct from invoking its
+            // operation. Re-read time here so adapter setup cannot enlarge the
+            // operation's share of the route-wide budget.
+            let attempt_start = self.clock.now();
+            if attempt_start >= overall_deadline {
+                return Err(RouteExhausted {
+                    attempts,
+                    overall_timeout: true,
+                });
+            }
+            let attempt_deadline = attempt_start
+                .saturating_add(Duration::from_secs(target_timeout))
+                .min(overall_deadline);
+            match block_on_until(
+                provider.complete(request),
+                cancellation,
+                &*self.clock,
+                attempt_deadline,
+                overall_deadline,
+            ) {
                 Ok(Ok(response)) => {
                     attempts.push(AttemptRecord {
                         route_index,
@@ -396,12 +483,32 @@ impl Application {
                     target_model,
                     error,
                 )),
+                Err(DeadlineOutcome::AttemptTimeout) => attempts.push(failed_attempt(
+                    route_index,
+                    provider_kind,
+                    target_model,
+                    TargetError::timeout(),
+                )),
+                Err(DeadlineOutcome::OverallTimeout) => {
+                    return Err(RouteExhausted {
+                        attempts,
+                        overall_timeout: true,
+                    })
+                }
                 // Do not start another potentially billable upstream request
                 // after the downstream client has disconnected.
-                Err(()) => return Err(RouteExhausted { attempts }),
+                Err(DeadlineOutcome::Cancelled) => {
+                    return Err(RouteExhausted {
+                        attempts,
+                        overall_timeout: false,
+                    })
+                }
             }
         }
-        Err(RouteExhausted { attempts })
+        Err(RouteExhausted {
+            attempts,
+            overall_timeout: false,
+        })
     }
 
     fn models_response(&self) -> HttpResponse {
@@ -666,10 +773,23 @@ fn serialize_tool_call(body: &mut String, call: &ToolCall) {
     ));
 }
 
-fn block_on<T>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlineOutcome {
+    AttemptTimeout,
+    OverallTimeout,
+    Cancelled,
+}
+
+/// Poll an upstream operation until it completes or reaches the earlier of its
+/// per-attempt and route-wide deadlines. The caller owns the future, so every
+/// timeout return drops it and therefore cancels the active upstream work.
+fn block_on_until<T>(
     mut future: crate::providers::ProviderFuture<'_, T>,
     cancellation: &DownstreamCancellation,
-) -> Result<T, ()> {
+    clock: &dyn MonotonicClock,
+    attempt_deadline: Duration,
+    overall_deadline: Duration,
+) -> Result<T, DeadlineOutcome> {
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -683,10 +803,27 @@ fn block_on<T>(
     let mut context = Context::from_waker(&waker);
     loop {
         if cancellation.is_cancelled() {
-            return Err(());
+            return Err(DeadlineOutcome::Cancelled);
+        }
+        // The overall deadline is checked first both before and after polling,
+        // making an exact tie deterministic even if the future changes time
+        // during its poll implementation.
+        if clock.now() >= overall_deadline {
+            return Err(DeadlineOutcome::OverallTimeout);
+        }
+        if clock.now() >= attempt_deadline {
+            return Err(DeadlineOutcome::AttemptTimeout);
         }
         match Pin::new(&mut future).poll(&mut context) {
-            Poll::Ready(value) => return Ok(value),
+            Poll::Ready(value) => {
+                if clock.now() >= overall_deadline {
+                    return Err(DeadlineOutcome::OverallTimeout);
+                }
+                if clock.now() >= attempt_deadline {
+                    return Err(DeadlineOutcome::AttemptTimeout);
+                }
+                return Ok(value);
+            }
             Poll::Pending => std::thread::yield_now(),
         }
     }

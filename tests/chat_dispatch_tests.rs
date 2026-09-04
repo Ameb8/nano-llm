@@ -1,10 +1,11 @@
 use nano_llm::{
-    app_with_provider_factory, CanonicalRequest, ChatChoice, ChatResponse, FinishReason,
-    HttpRequest, Provider, ProviderFuture, ProviderStream, RuntimeConfig, RuntimeGeneralSettings,
-    RuntimeRoute, RuntimeTarget, TargetError,
+    app_with_provider_factory, app_with_provider_factory_and_clock, CanonicalRequest, ChatChoice,
+    ChatResponse, FinishReason, HttpRequest, Provider, ProviderFuture, ProviderStream,
+    RuntimeConfig, RuntimeGeneralSettings, RuntimeRoute, RuntimeTarget, TargetError,
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn target(suffix: &str) -> RuntimeTarget {
     RuntimeTarget {
@@ -541,4 +542,217 @@ fn downstream_cancellation_drops_active_provider_work() {
     );
     assert_eq!(response.status, 502);
     assert!(dropped.load(Ordering::Acquire));
+}
+
+#[derive(Default)]
+struct PausedClock(AtomicU64);
+
+impl PausedClock {
+    fn advance(&self, duration: Duration) {
+        self.0.fetch_add(duration.as_secs(), Ordering::AcqRel);
+    }
+}
+
+impl nano_llm::MonotonicClock for PausedClock {
+    fn now(&self) -> Duration {
+        Duration::from_secs(self.0.load(Ordering::Acquire))
+    }
+}
+
+struct PendingThroughDeadline {
+    clock: Arc<PausedClock>,
+    advance: Duration,
+    dropped: Arc<AtomicBool>,
+}
+
+impl std::future::Future for PendingThroughDeadline {
+    type Output = Result<ChatResponse, TargetError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.clock.advance(self.advance);
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for PendingThroughDeadline {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+struct DeadlineProvider {
+    clock: Arc<PausedClock>,
+    advance: Option<Duration>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Provider for DeadlineProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        match self.advance {
+            Some(advance) => Box::pin(PendingThroughDeadline {
+                clock: self.clock.clone(),
+                advance,
+                dropped: self.dropped.clone(),
+            }),
+            None => Box::pin(async { Ok(successful_response(FinishReason::Stop)) }),
+        }
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+}
+
+#[test]
+fn attempt_timeout_uses_resolved_target_timeout_cancels_work_and_advances() {
+    let clock = Arc::new(PausedClock::default());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let invoked = Arc::new(Mutex::new(Vec::new()));
+    let mut first = target("per-target");
+    first.timeout = 3;
+    first.explicit_timeout = Some(3);
+    let mut second = target("global-default");
+    // Runtime configuration resolves absent target overrides to this global
+    // value before routing constructs an adapter.
+    second.timeout = 7;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            request_timeout: 7,
+            overall_timeout: 10,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![first, second],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            let dropped = dropped.clone();
+            let invoked = invoked.clone();
+            move |target| {
+                invoked
+                    .lock()
+                    .unwrap()
+                    .push((target.model_suffix.clone(), target.timeout));
+                Box::new(DeadlineProvider {
+                    clock: clock.clone(),
+                    advance: (target.model_suffix == "per-target").then(|| Duration::from_secs(3)),
+                    dropped: dropped.clone(),
+                })
+            }
+        }),
+        clock.clone(),
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        *invoked.lock().unwrap(),
+        vec![("per-target".into(), 3), ("global-default".into(), 7)]
+    );
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "attempt expiry must drop active upstream work"
+    );
+}
+
+#[test]
+fn overall_deadline_clips_attempt_returns_exact_504_and_never_starts_fallback() {
+    let clock = Arc::new(PausedClock::default());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let mut first = target("long");
+    first.timeout = 10;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            overall_timeout: 5,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![first, target("never")],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            let dropped = dropped.clone();
+            let invoked = invoked.clone();
+            move |_| {
+                invoked.fetch_add(1, Ordering::AcqRel);
+                Box::new(DeadlineProvider {
+                    clock: clock.clone(),
+                    advance: Some(Duration::from_secs(5)),
+                    dropped: dropped.clone(),
+                })
+            }
+        }),
+        clock,
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+    assert_eq!(response.status, 504);
+    assert_eq!(response.body, br#"{"error":{"message":"Overall request timed out","type":"server_error","param":null,"code":"overall_timeout"}}"#);
+    assert_eq!(invoked.load(Ordering::Acquire), 1);
+    assert!(dropped.load(Ordering::Acquire));
+}
+
+#[test]
+fn simultaneous_attempt_and_overall_expiry_is_classified_as_overall_timeout() {
+    let clock = Arc::new(PausedClock::default());
+    let mut only = target("tie");
+    only.timeout = 5;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            overall_timeout: 5,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![only],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            move |_| {
+                Box::new(DeadlineProvider {
+                    clock: clock.clone(),
+                    advance: Some(Duration::from_secs(5)),
+                    dropped: Arc::new(AtomicBool::new(false)),
+                })
+            }
+        }),
+        clock,
+    );
+
+    assert_eq!(
+        application
+            .handle(&chat(
+                br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#
+            ))
+            .status,
+        504
+    );
 }

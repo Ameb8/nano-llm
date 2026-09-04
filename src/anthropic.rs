@@ -1,9 +1,8 @@
-//! Anthropic Messages request translation.
+//! Anthropic Messages translation.
 //!
-//! This module intentionally owns only the request half of the Messages API.
-//! Response and SSE event translation are separate delivery slices, so a 2xx
-//! response is conservatively treated as an invalid response until that work
-//! exists rather than being mistaken for a successful canonical completion.
+//! The buffered response parser is deliberately strict: a 2xx status only
+//! succeeds after its Messages payload has been converted through the shared
+//! canonical response conformance boundary.  SSE remains a separate slice.
 
 use crate::config::{ProviderKind, RuntimeTarget};
 use crate::providers::{
@@ -11,7 +10,10 @@ use crate::providers::{
     SecureTransportPolicy, TargetError, TransportErrorKind,
 };
 use crate::request::{decode_json_value, CanonicalRequest, JsonValue, ToolChoice};
-use crate::response::ChatResponse;
+use crate::response::{
+    build_response, normalize_usage, ChatResponse, NativeTerminal, NativeToolCall, ResponseError,
+    ResponseMetadata,
+};
 use std::sync::Arc;
 
 /// Anthropic Messages adapter for one validated target.
@@ -121,7 +123,19 @@ impl Provider for AnthropicProvider {
             if !(200..300).contains(&response.status) {
                 return Err(TargetError::from_upstream_status(response.status));
             }
-            Err(TargetError::invalid_response())
+            if response.body.len() > MAX_BUFFERED_RESPONSE_BYTES {
+                return Err(TargetError::invalid_response());
+            }
+            let native = parse_response(&response.body)?;
+            build_response(
+                request,
+                ResponseMetadata::for_model(&request.model),
+                native.content,
+                native.calls,
+                native.terminal,
+                native.usage,
+            )
+            .map_err(response_error)
         })
     }
 
@@ -143,6 +157,162 @@ impl Provider for AnthropicProvider {
             Err(TargetError::invalid_response())
         })
     }
+}
+
+/// Fixed bound for a buffered native completion.  This matches the shared
+/// compatible-family bound while keeping this adapter independently safe.
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+struct NativeMessage {
+    content: Option<String>,
+    calls: Vec<NativeToolCall>,
+    terminal: NativeTerminal,
+    usage: Option<crate::response::Usage>,
+}
+
+fn response_error(error: ResponseError) -> TargetError {
+    match error {
+        ResponseError::Overloaded => TargetError::overloaded(),
+        ResponseError::InvalidResponse(_) => TargetError::invalid_response(),
+    }
+}
+
+/// Decode exactly the Messages response fields that define canonical output.
+/// Provider response IDs and all other provider-only metadata are ignored.
+fn parse_response(bytes: &[u8]) -> Result<NativeMessage, TargetError> {
+    let root =
+        crate::request::decode_json_object(bytes).map_err(|_| TargetError::invalid_response())?;
+    if !matches!(get(&root, "type"), Some(JsonValue::String(kind)) if kind == "message")
+        || !matches!(get(&root, "role"), Some(JsonValue::String(role)) if role == "assistant")
+    {
+        return Err(TargetError::invalid_response());
+    }
+    let blocks = array(required(&root, "content")?)?;
+    let (content, calls) = parse_blocks(blocks)?;
+    let terminal = match required(&root, "stop_reason")? {
+        JsonValue::String(reason) => terminal(reason),
+        // A non-streaming response must be terminal.
+        _ => return Err(TargetError::invalid_response()),
+    };
+    let usage = match get(&root, "usage") {
+        None | Some(JsonValue::Null) => None,
+        Some(value) => parse_usage(value),
+    };
+    Ok(NativeMessage {
+        content,
+        calls,
+        terminal,
+        usage,
+    })
+}
+
+/// Anthropic content blocks may interleave text and tool uses.  The canonical
+/// representation has one text field plus an ordered call list, so text is
+/// joined with no synthetic separator and tool calls retain their native order.
+fn parse_blocks(
+    blocks: &[JsonValue],
+) -> Result<(Option<String>, Vec<NativeToolCall>), TargetError> {
+    let mut text = String::new();
+    let mut saw_text = false;
+    let mut calls = Vec::new();
+    for block in blocks {
+        let block = object(block)?;
+        match string(required(block, "type")?)? {
+            "text" => {
+                text.push_str(string(required(block, "text")?)?);
+                saw_text = true;
+            }
+            "tool_use" => {
+                let id = match get(block, "id") {
+                    None => None,
+                    Some(JsonValue::String(id)) => Some(id.clone()),
+                    Some(_) => return Err(TargetError::invalid_response()),
+                };
+                let name = string(required(block, "name")?)?.to_owned();
+                let input = object(required(block, "input")?)?;
+                calls.push(NativeToolCall {
+                    id,
+                    name,
+                    arguments: encode(&JsonValue::Object(input.to_vec())),
+                });
+            }
+            // v0.1 only has canonical counterparts for text and completed
+            // function calls.  Silently dropping a native block would make a
+            // malformed/unsupported 2xx response look successful.
+            _ => return Err(TargetError::invalid_response()),
+        }
+    }
+    Ok((saw_text.then_some(text), calls))
+}
+
+fn parse_usage(value: &JsonValue) -> Option<crate::response::Usage> {
+    let JsonValue::Object(usage) = value else {
+        return None;
+    };
+    normalize_usage(
+        get(usage, "input_tokens").and_then(unsigned_optional),
+        get(usage, "output_tokens").and_then(unsigned_optional),
+    )
+}
+
+fn unsigned_optional(value: &JsonValue) -> Option<u128> {
+    unsigned(value).ok().map(u128::from)
+}
+
+fn terminal(reason: &str) -> NativeTerminal {
+    match reason {
+        "end_turn" | "stop_sequence" => NativeTerminal::Stop,
+        "max_tokens" | "model_context_window_exceeded" => NativeTerminal::Length,
+        "tool_use" => NativeTerminal::ToolCalls,
+        "refusal" => NativeTerminal::ContentFilter,
+        // Server-side tool continuation has no portable v0.1 representation.
+        "pause_turn" => NativeTerminal::Invalid,
+        _ => NativeTerminal::Unknown,
+    }
+}
+
+fn required<'a>(
+    fields: &'a [(String, JsonValue)],
+    name: &str,
+) -> Result<&'a JsonValue, TargetError> {
+    get(fields, name).ok_or_else(TargetError::invalid_response)
+}
+
+fn get<'a>(fields: &'a [(String, JsonValue)], name: &str) -> Option<&'a JsonValue> {
+    fields
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value))
+}
+
+fn object(value: &JsonValue) -> Result<&[(String, JsonValue)], TargetError> {
+    match value {
+        JsonValue::Object(fields) => Ok(fields),
+        _ => Err(TargetError::invalid_response()),
+    }
+}
+
+fn array(value: &JsonValue) -> Result<&[JsonValue], TargetError> {
+    match value {
+        JsonValue::Array(values) => Ok(values),
+        _ => Err(TargetError::invalid_response()),
+    }
+}
+
+fn string(value: &JsonValue) -> Result<&str, TargetError> {
+    match value {
+        JsonValue::String(value) => Ok(value),
+        _ => Err(TargetError::invalid_response()),
+    }
+}
+
+fn unsigned(value: &JsonValue) -> Result<u64, TargetError> {
+    let JsonValue::Number(value) = value else {
+        return Err(TargetError::invalid_response());
+    };
+    if value.contains(['.', 'e', 'E']) {
+        return Err(TargetError::invalid_response());
+    }
+    value.parse().map_err(|_| TargetError::invalid_response())
 }
 
 fn transport_error(error: crate::providers::TransportError) -> TargetError {
@@ -366,11 +536,24 @@ mod tests {
     use std::sync::Mutex;
     use std::task::{Context, Poll, Wake, Waker};
 
-    struct CaptureTransport(Mutex<Vec<OutboundRequest>>);
+    struct CaptureTransport {
+        requests: Mutex<Vec<OutboundRequest>>,
+        response: Mutex<Result<OutboundResponse, TransportError>>,
+    }
 
     impl CaptureTransport {
+        fn returning(status: u16, body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                response: Mutex::new(Ok(OutboundResponse {
+                    status,
+                    body: body.into(),
+                })),
+            }
+        }
+
         fn request(&self) -> OutboundRequest {
-            self.0.lock().unwrap()[0].clone()
+            self.requests.lock().unwrap()[0].clone()
         }
     }
 
@@ -381,11 +564,8 @@ mod tests {
             request: OutboundRequest,
         ) -> Result<OutboundResponse, TransportError> {
             assert_eq!(policy, SecureTransportPolicy::default());
-            self.0.lock().unwrap().push(request);
-            Ok(OutboundResponse {
-                status: 500,
-                body: vec![],
-            })
+            self.requests.lock().unwrap().push(request);
+            self.response.lock().unwrap().clone()
         }
 
         fn execute_stream(
@@ -394,7 +574,7 @@ mod tests {
             request: OutboundRequest,
         ) -> Result<crate::providers::OutboundStreamResponse, TransportError> {
             assert_eq!(policy, SecureTransportPolicy::default());
-            self.0.lock().unwrap().push(request);
+            self.requests.lock().unwrap().push(request);
             Ok(crate::providers::OutboundStreamResponse {
                 status: 500,
                 body: Box::new(std::iter::empty()),
@@ -432,7 +612,7 @@ mod tests {
 
     fn captured(body: &str) -> Vec<(String, JsonValue)> {
         let request = decode_chat_request(body.as_bytes()).unwrap();
-        let transport = Arc::new(CaptureTransport(Mutex::new(Vec::new())));
+        let transport = Arc::new(CaptureTransport::returning(500, Vec::new()));
         let provider = AnthropicProvider::new(target(), transport.clone());
         assert_eq!(
             block_on(provider.complete(&request)).unwrap_err().kind,
@@ -577,7 +757,7 @@ mod tests {
             br#"{"model":"public","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"stream":true}"#,
         )
         .unwrap();
-        let transport = Arc::new(CaptureTransport(Mutex::new(Vec::new())));
+        let transport = Arc::new(CaptureTransport::returning(500, Vec::new()));
         let provider = AnthropicProvider::new(target(), transport.clone());
         let result = block_on(provider.complete_stream(&request));
         assert!(matches!(
@@ -586,5 +766,151 @@ mod tests {
         ));
         let body = crate::request::decode_json_object(&transport.request().body).unwrap();
         assert_eq!(field(&body, "stream"), Some(&JsonValue::Bool(true)));
+    }
+
+    fn completion_request(with_tools: bool) -> CanonicalRequest {
+        let tools = if with_tools {
+            r#", "tools":[{"type":"function","function":{"name":"weather"}}],"tool_choice":"auto""#
+        } else {
+            ""
+        };
+        decode_chat_request(
+            format!(
+                r#"{{"model":"public","messages":[{{"role":"user","content":"hi"}}],"max_tokens":8{tools}}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn complete(body: impl Into<Vec<u8>>, with_tools: bool) -> Result<ChatResponse, TargetError> {
+        let transport = Arc::new(CaptureTransport::returning(200, body));
+        block_on(
+            AnthropicProvider::new(target(), transport).complete(&completion_request(with_tools)),
+        )
+    }
+
+    #[test]
+    fn buffered_messages_normalize_text_tools_usage_and_gateway_metadata() {
+        let response = complete(
+            r#"{"id":"msg_provider_private","type":"message","role":"assistant","content":[{"type":"text","text":"one"},{"type":"tool_use","id":"native","name":"weather","input":{"city":"Montréal","days":2}},{"type":"text","text":" two"},{"type":"tool_use","id":"native","name":"weather","input":{}}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":5}}"#,
+            true,
+        )
+        .unwrap();
+        assert!(response.id.starts_with("chatcmpl-"));
+        assert_eq!(response.model, "public");
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("one two")
+        );
+        assert_eq!(response.choices[0].finish_reason.as_str(), "tool_calls");
+        let calls = response.choices[0].message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "native");
+        assert!(calls[1].id.starts_with("call_"));
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"city":"Montréal","days":2}"#
+        );
+        assert_eq!(calls[1].function.arguments, "{}");
+        assert_eq!(response.usage.unwrap().total_tokens, 8);
+    }
+
+    #[test]
+    fn documented_stop_reasons_and_explicit_refusal_are_normalized() {
+        for (reason, expected) in [
+            ("end_turn", "stop"),
+            ("stop_sequence", "stop"),
+            ("max_tokens", "length"),
+            ("model_context_window_exceeded", "length"),
+        ] {
+            let response = complete(
+                format!(
+                    r#"{{"type":"message","role":"assistant","content":[{{"type":"text","text":"ok"}}],"stop_reason":"{reason}"}}"#
+                ),
+                false,
+            )
+            .unwrap();
+            assert_eq!(response.choices[0].finish_reason.as_str(), expected);
+        }
+        let tool = complete(
+            r#"{"type":"message","role":"assistant","content":[{"type":"tool_use","id":"x","name":"weather","input":{}}],"stop_reason":"tool_use"}"#,
+            true,
+        )
+        .unwrap();
+        assert_eq!(tool.choices[0].finish_reason.as_str(), "tool_calls");
+
+        // Anthropic's explicit refusal is a successful policy outcome even
+        // when it has no candidate blocks to expose.
+        let refusal = complete(
+            r#"{"type":"message","role":"assistant","content":[],"stop_reason":"refusal"}"#,
+            false,
+        )
+        .unwrap();
+        assert_eq!(refusal.choices[0].finish_reason.as_str(), "content_filter");
+        assert_eq!(refusal.choices[0].message.content, None);
+    }
+
+    #[test]
+    fn malformed_2xx_unknown_empty_and_pause_turn_are_target_errors() {
+        for body in [
+            br#"not json"#.as_slice(),
+            br#"{"type":"message","role":"assistant","content":[{"type":"tool_use","name":"weather","input":[]}],"stop_reason":"tool_use"}"#
+                .as_slice(),
+            br#"{"type":"message","role":"assistant","content":[],"stop_reason":"pause_turn"}"#
+                .as_slice(),
+            br#"{"type":"message","role":"assistant","content":[],"stop_reason":"future_reason"}"#
+                .as_slice(),
+        ] {
+            assert_eq!(
+                complete(body.to_vec(), true).unwrap_err().kind,
+                crate::providers::TargetErrorKind::InvalidResponse
+            );
+        }
+        let unknown_with_text = complete(
+            br#"{"type":"message","role":"assistant","content":[{"type":"text","text":"still valid"}],"stop_reason":"future_reason","usage":{"input_tokens":-1,"output_tokens":2}}"#,
+            false,
+        )
+        .unwrap();
+        assert_eq!(unknown_with_text.choices[0].finish_reason.as_str(), "stop");
+        assert!(unknown_with_text.usage.is_none());
+    }
+
+    #[test]
+    fn native_http_and_transport_failures_stay_structured() {
+        let request = completion_request(false);
+        for (status, expected) in [
+            (401, crate::providers::TargetErrorKind::Authentication),
+            (429, crate::providers::TargetErrorKind::RateLimited),
+            (503, crate::providers::TargetErrorKind::Overloaded),
+            (500, crate::providers::TargetErrorKind::UpstreamHttp),
+        ] {
+            let transport = Arc::new(CaptureTransport::returning(status, b"ignored".to_vec()));
+            assert_eq!(
+                block_on(AnthropicProvider::new(target(), transport).complete(&request))
+                    .unwrap_err()
+                    .kind,
+                expected
+            );
+        }
+        let transport = Arc::new(CaptureTransport {
+            requests: Mutex::new(Vec::new()),
+            response: Mutex::new(Err(TransportError {
+                kind: TransportErrorKind::Connection,
+            })),
+        });
+        assert_eq!(
+            block_on(AnthropicProvider::new(target(), transport).complete(&request))
+                .unwrap_err()
+                .kind,
+            crate::providers::TargetErrorKind::ConnectionError
+        );
+        assert_eq!(
+            complete(vec![b'x'; MAX_BUFFERED_RESPONSE_BYTES + 1], false)
+                .unwrap_err()
+                .kind,
+            crate::providers::TargetErrorKind::InvalidResponse
+        );
     }
 }

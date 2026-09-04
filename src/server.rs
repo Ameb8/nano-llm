@@ -5,7 +5,7 @@ use crate::providers::{build_provider, Provider, TargetError, TargetErrorKind};
 use crate::request::{
     decode_chat_request_fields, decode_json_object, requested_model, DecodeError,
 };
-use crate::response::{ChatResponse, ToolCall};
+use crate::response::{ChatChunk, ChatResponse, ToolCall};
 use std::fmt::Write;
 use std::fs::File;
 use std::io::Read;
@@ -188,6 +188,18 @@ pub struct RouteDiagnostics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteDispatch {
     pub response: ChatResponse,
+    pub attempts: Vec<AttemptRecord>,
+    pub diagnostics: RouteDiagnostics,
+}
+
+/// A stream selected while the downstream response is still uncommitted.
+///
+/// `first_chunk` is deliberately separate from `stream`: routing consumed and
+/// validated it before reporting success, so the HTTP boundary can commit only
+/// after it has something canonical to send.
+pub struct StreamRouteDispatch {
+    pub first_chunk: ChatChunk,
+    pub stream: crate::providers::ProviderStream,
     pub attempts: Vec<AttemptRecord>,
     pub diagnostics: RouteDiagnostics,
 }
@@ -413,11 +425,19 @@ impl Application {
             return decode_error_response(error);
         }
         if canonical.stream {
-            return error_response(GatewayError::new(
-                GatewayErrorKind::InvalidRequest,
-                "Streaming is not supported",
-                Some("stream".into()),
-            ));
+            return match self.dispatch_stream_route(route, &canonical, &request.cancellation) {
+                Ok(dispatch) => sse_response(dispatch),
+                Err(exhausted) if exhausted.overall_timeout => error_response(GatewayError::new(
+                    GatewayErrorKind::OverallTimeout,
+                    "Overall request timed out",
+                    None,
+                )),
+                Err(_) => error_response(GatewayError::new(
+                    GatewayErrorKind::UpstreamExhausted,
+                    "All configured upstream targets failed",
+                    None,
+                )),
+            };
         }
 
         // The response is materialized by the adapter before this function
@@ -532,6 +552,156 @@ impl Application {
                     });
                     return Err(route_exhausted(request, attempts, false, true));
                 }
+            }
+        }
+        Err(route_exhausted(request, attempts, false, false))
+    }
+
+    /// Select a streaming target without committing a downstream response.
+    /// Every setup error, terminal-before-chunk, decoder error, or deadline
+    /// expiry is still a normal target failure and advances exactly once.
+    pub fn dispatch_stream_route(
+        &self,
+        route: &crate::config::RuntimeRoute,
+        request: &crate::request::CanonicalRequest,
+        cancellation: &DownstreamCancellation,
+    ) -> Result<StreamRouteDispatch, RouteExhausted> {
+        let overall_deadline = self.clock.now().saturating_add(Duration::from_secs(
+            self.config.general_settings.overall_timeout,
+        ));
+        let mut attempts = Vec::with_capacity(route.targets.len());
+        for (route_index, target) in route.targets.iter().cloned().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(route_exhausted(request, attempts, false, true));
+            }
+            if self.clock.now() >= overall_deadline {
+                return Err(route_exhausted(request, attempts, true, false));
+            }
+            let provider_kind = target.provider;
+            let target_model = target.model.clone();
+            let target_timeout = target.timeout;
+            let provider = (self.provider_factory)(target);
+            let attempt_start = self.clock.now();
+            if attempt_start >= overall_deadline {
+                return Err(route_exhausted(request, attempts, true, false));
+            }
+            let attempt_deadline = attempt_start
+                .saturating_add(Duration::from_secs(target_timeout))
+                .min(overall_deadline);
+            let stream = match block_on_until(
+                provider.complete_stream(request),
+                cancellation,
+                &*self.clock,
+                attempt_deadline,
+                overall_deadline,
+            ) {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    attempts.push(failed_attempt(
+                        route_index,
+                        provider_kind,
+                        target_model,
+                        error,
+                    ));
+                    continue;
+                }
+                Err(DeadlineOutcome::AttemptTimeout) => {
+                    attempts.push(failed_attempt(
+                        route_index,
+                        provider_kind,
+                        target_model,
+                        TargetError::timeout(),
+                    ));
+                    continue;
+                }
+                Err(DeadlineOutcome::OverallTimeout) => {
+                    return Err(route_exhausted(request, attempts, true, false))
+                }
+                Err(DeadlineOutcome::Cancelled) => {
+                    attempts.push(AttemptRecord {
+                        route_index,
+                        provider: provider_kind,
+                        target_model,
+                        outcome: AttemptOutcome::Cancelled,
+                    });
+                    return Err(route_exhausted(request, attempts, false, true));
+                }
+            };
+            let mut stream = stream;
+            // Iterators are adapter-owned synchronous decoders. Check both
+            // sides of `next` so decoder work counts toward the same first
+            // canonical-chunk budget as connection setup.
+            let first = if cancellation.is_cancelled() {
+                attempts.push(AttemptRecord {
+                    route_index,
+                    provider: provider_kind,
+                    target_model,
+                    outcome: AttemptOutcome::Cancelled,
+                });
+                return Err(route_exhausted(request, attempts, false, true));
+            } else if self.clock.now() >= overall_deadline {
+                return Err(route_exhausted(request, attempts, true, false));
+            } else if self.clock.now() >= attempt_deadline {
+                attempts.push(failed_attempt(
+                    route_index,
+                    provider_kind,
+                    target_model,
+                    TargetError::timeout(),
+                ));
+                continue;
+            } else {
+                stream.next()
+            };
+            if self.clock.now() >= overall_deadline {
+                return Err(route_exhausted(request, attempts, true, false));
+            }
+            if cancellation.is_cancelled() {
+                attempts.push(AttemptRecord {
+                    route_index,
+                    provider: provider_kind,
+                    target_model,
+                    outcome: AttemptOutcome::Cancelled,
+                });
+                return Err(route_exhausted(request, attempts, false, true));
+            }
+            if self.clock.now() >= attempt_deadline {
+                attempts.push(failed_attempt(
+                    route_index,
+                    provider_kind,
+                    target_model,
+                    TargetError::timeout(),
+                ));
+                continue;
+            }
+            match first {
+                Some(Ok(first_chunk)) => {
+                    attempts.push(AttemptRecord {
+                        route_index,
+                        provider: provider_kind,
+                        target_model,
+                        outcome: AttemptOutcome::Succeeded,
+                    });
+                    return Ok(StreamRouteDispatch {
+                        first_chunk,
+                        stream,
+                        diagnostics: route_diagnostics(request, &attempts),
+                        attempts,
+                    });
+                }
+                Some(Err(error)) => attempts.push(failed_attempt(
+                    route_index,
+                    provider_kind,
+                    target_model,
+                    error,
+                )),
+                // A terminal signal before an ordinary canonical chunk is an
+                // invalid response, not an empty successful stream.
+                None => attempts.push(failed_attempt(
+                    route_index,
+                    provider_kind,
+                    target_model,
+                    TargetError::invalid_response(),
+                )),
             }
         }
         Err(route_exhausted(request, attempts, false, false))
@@ -897,6 +1067,115 @@ fn json_response(status: u16, body: String) -> HttpResponse {
         headers: vec![("content-type".into(), "application/json".into())],
         body: body.into_bytes(),
     }
+}
+
+/// Materialize the selected stream at this dependency-free HTTP seam. The
+/// selection routine has already buffered the first canonical chunk, so these
+/// SSE headers cannot be observed for a target that later proves invalid
+/// before its first chunk. A real network adapter may write the same events
+/// incrementally after this commitment point.
+fn sse_response(mut dispatch: StreamRouteDispatch) -> HttpResponse {
+    let mut body = String::new();
+    serialize_sse_chunk(&mut body, &dispatch.first_chunk);
+    let mut completed = true;
+    for item in dispatch.stream.by_ref() {
+        match item {
+            Ok(chunk) => serialize_sse_chunk(&mut body, &chunk),
+            // Failures after the first chunk are deliberately not retried and
+            // do not receive a gateway-invented terminal event.
+            Err(_) => {
+                completed = false;
+                break;
+            }
+        }
+    }
+    if completed {
+        body.push_str("data: [DONE]\n\n");
+    }
+    HttpResponse {
+        status: 200,
+        headers: vec![
+            ("content-type".into(), "text/event-stream".into()),
+            ("cache-control".into(), "no-cache".into()),
+        ],
+        body: body.into_bytes(),
+    }
+}
+
+fn serialize_sse_chunk(body: &mut String, chunk: &ChatChunk) {
+    body.push_str("data: {");
+    body.push_str(&format!(
+        "\"id\":\"{}\",\"object\":\"{}\",\"created\":{},\"model\":\"{}\",\"choices\":[",
+        json_escape(&chunk.id),
+        chunk.object,
+        chunk.created,
+        json_escape(&chunk.model)
+    ));
+    for (choice_index, choice) in chunk.choices.iter().enumerate() {
+        if choice_index != 0 {
+            body.push(',');
+        }
+        body.push_str(&format!("{{\"index\":{},\"delta\":{{", choice.index));
+        let mut needs_comma = false;
+        if let Some(role) = choice.delta.role {
+            body.push_str(&format!("\"role\":\"{}\"", role));
+            needs_comma = true;
+        }
+        if let Some(content) = &choice.delta.content {
+            if needs_comma {
+                body.push(',');
+            }
+            body.push_str(&format!("\"content\":\"{}\"", json_escape(content)));
+            needs_comma = true;
+        }
+        if !choice.delta.tool_calls.is_empty() {
+            if needs_comma {
+                body.push(',');
+            }
+            body.push_str("\"tool_calls\":[");
+            for (call_index, call) in choice.delta.tool_calls.iter().enumerate() {
+                if call_index != 0 {
+                    body.push(',');
+                }
+                body.push_str(&format!("{{\"index\":{}", call.index));
+                if let Some(id) = &call.id {
+                    body.push_str(&format!(",\"id\":\"{}\"", json_escape(id)));
+                }
+                if let Some(kind) = call.r#type {
+                    body.push_str(&format!(",\"type\":\"{}\"", kind));
+                }
+                if call.name.is_some() || call.arguments.is_some() {
+                    body.push_str(",\"function\":{");
+                    if let Some(name) = &call.name {
+                        body.push_str(&format!("\"name\":\"{}\"", json_escape(name)));
+                    }
+                    if let Some(arguments) = &call.arguments {
+                        if call.name.is_some() {
+                            body.push(',');
+                        }
+                        body.push_str(&format!("\"arguments\":\"{}\"", json_escape(arguments)));
+                    }
+                    body.push('}');
+                }
+                body.push('}');
+            }
+            body.push(']');
+        }
+        body.push_str("},\"finish_reason\":");
+        match choice.finish_reason {
+            Some(reason) => body.push_str(&format!("\"{}\"", reason.as_str())),
+            None => body.push_str("null"),
+        }
+        body.push('}');
+    }
+    body.push(']');
+    if let Some(usage) = &chunk.usage {
+        body.push_str(&format!(
+            ",\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}",
+            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+        ));
+    }
+    body.push_str("}\n\n");
 }
 
 fn with_request_id(mut response: HttpResponse, request_id: String) -> HttpResponse {

@@ -1,7 +1,8 @@
 use nano_llm::{
-    app_with_provider_factory, app_with_provider_factory_and_clock, CanonicalRequest, ChatChoice,
-    ChatResponse, FinishReason, HttpRequest, Provider, ProviderFuture, ProviderStream,
-    RuntimeConfig, RuntimeGeneralSettings, RuntimeRoute, RuntimeTarget, TargetError,
+    app_with_provider_factory, app_with_provider_factory_and_clock, AssistantDelta,
+    CanonicalRequest, ChatChoice, ChatChunk, ChatResponse, ChunkChoice, FinishReason, HttpRequest,
+    Provider, ProviderFuture, ProviderStream, RuntimeConfig, RuntimeGeneralSettings, RuntimeRoute,
+    RuntimeTarget, TargetError,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -447,7 +448,7 @@ fn exhausted_dispatch_retains_only_safe_attempt_metadata() {
 }
 
 #[test]
-fn route_aware_validation_and_stream_rejection_precede_provider_work_and_release_capacity() {
+fn route_aware_validation_precedes_streaming_provider_work_and_releases_capacity() {
     let targets = Arc::new(Mutex::new(Vec::new()));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut anthropic = target("claude");
@@ -463,8 +464,8 @@ fn route_aware_validation_and_stream_rejection_precede_provider_work_and_release
     let stream = application.handle(&chat(
         br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":true}"#,
     ));
-    assert_eq!(stream.status, 400);
-    assert!(targets.lock().unwrap().is_empty());
+    assert_eq!(stream.status, 502);
+    assert_eq!(*targets.lock().unwrap(), vec!["claude"]);
 
     let valid =
         br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#;
@@ -472,8 +473,114 @@ fn route_aware_validation_and_stream_rejection_precede_provider_work_and_release
     // The second request would receive 503 if the successful request's permit
     // were not released exactly once at the end of provider dispatch.
     assert_eq!(application.handle(&chat(valid)).status, 200);
-    assert_eq!(*targets.lock().unwrap(), vec!["claude", "claude"]);
+    assert_eq!(*targets.lock().unwrap(), vec!["claude", "claude", "claude"]);
     assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[derive(Clone)]
+enum StreamOutcome {
+    SetupError(TargetError),
+    Events(Vec<Result<ChatChunk, TargetError>>),
+}
+
+struct SequencedStreamProvider(StreamOutcome);
+
+impl Provider for SequencedStreamProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        let outcome = self.0.clone();
+        Box::pin(async move {
+            match outcome {
+                StreamOutcome::SetupError(error) => Err(error),
+                StreamOutcome::Events(events) => Ok(Box::new(events.into_iter()) as ProviderStream),
+            }
+        })
+    }
+}
+
+fn canonical_chunk(content: &str) -> ChatChunk {
+    ChatChunk {
+        id: "stream-id".into(),
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "public".into(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: AssistantDelta {
+                role: Some("assistant"),
+                content: Some(content.into()),
+                tool_calls: vec![],
+            },
+            finish_reason: None,
+        }],
+        usage: None,
+    }
+}
+
+#[test]
+fn streaming_buffers_the_first_canonical_chunk_then_fails_over_once_per_precommit_error() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = [
+        StreamOutcome::SetupError(TargetError::connection()),
+        // A terminal-only native stream is represented at the provider seam
+        // by an exhausted canonical iterator.
+        StreamOutcome::Events(vec![]),
+        StreamOutcome::Events(vec![Err(TargetError::invalid_response())]),
+        StreamOutcome::Events(vec![Ok(canonical_chunk("chosen"))]),
+    ];
+    let targets = (0..outcomes.len())
+        .map(|index| target(&format!("entry-{index}")))
+        .collect();
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets,
+        }],
+    };
+    let next = Arc::new(AtomicUsize::new(0));
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new({
+            let seen = seen.clone();
+            move |target| {
+                seen.lock().unwrap().push(target.model_suffix);
+                let index = next.fetch_add(1, Ordering::AcqRel);
+                Box::new(SequencedStreamProvider(outcomes[index].clone()))
+            }
+        }),
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.header_values("content-type").collect::<Vec<_>>(),
+        vec!["text/event-stream"]
+    );
+    assert_eq!(
+        response.header_values("cache-control").collect::<Vec<_>>(),
+        vec!["no-cache"]
+    );
+    let body = std::str::from_utf8(&response.body).unwrap();
+    assert_eq!(body.matches("\"content\":\"chosen\"").count(), 1);
+    assert!(body.ends_with("data: [DONE]\n\n"));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["entry-0", "entry-1", "entry-2", "entry-3"]
+    );
 }
 
 #[test]
@@ -804,6 +911,87 @@ fn overall_deadline_clips_attempt_returns_exact_504_and_never_starts_fallback() 
     assert_eq!(response.body, br#"{"error":{"message":"Overall request timed out","type":"server_error","param":null,"code":"overall_timeout"}}"#);
     assert_eq!(invoked.load(Ordering::Acquire), 1);
     assert!(dropped.load(Ordering::Acquire));
+}
+
+struct ChunkAfterDeadline {
+    clock: Arc<PausedClock>,
+    emitted: bool,
+}
+
+impl Iterator for ChunkAfterDeadline {
+    type Item = Result<ChatChunk, TargetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.emitted {
+            return None;
+        }
+        self.emitted = true;
+        self.clock.advance(Duration::from_secs(5));
+        Some(Ok(canonical_chunk("too-late")))
+    }
+}
+
+struct FirstChunkDeadlineProvider {
+    clock: Arc<PausedClock>,
+}
+
+impl Provider for FirstChunkDeadlineProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        let clock = self.clock.clone();
+        Box::pin(async move {
+            Ok(Box::new(ChunkAfterDeadline {
+                clock,
+                emitted: false,
+            }) as ProviderStream)
+        })
+    }
+}
+
+#[test]
+fn streaming_first_chunk_deadline_uses_overall_timeout_precedence() {
+    let clock = Arc::new(PausedClock::default());
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            overall_timeout: 5,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("late"), target("must-not-run")],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            let invoked = invoked.clone();
+            move |_| {
+                invoked.fetch_add(1, Ordering::AcqRel);
+                Box::new(FirstChunkDeadlineProvider {
+                    clock: clock.clone(),
+                })
+            }
+        }),
+        clock,
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    assert_eq!(response.status, 504);
+    assert_eq!(invoked.load(Ordering::Acquire), 1);
 }
 
 #[test]

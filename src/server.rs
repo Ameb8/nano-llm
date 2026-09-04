@@ -1,7 +1,7 @@
 //! Dependency-free inbound HTTP contract and router-level test seam.
 
-use crate::config::RuntimeConfig;
-use crate::providers::{build_provider, Provider};
+use crate::config::{ProviderKind, RuntimeConfig};
+use crate::providers::{build_provider, Provider, TargetError, TargetErrorKind};
 use crate::request::{
     decode_chat_request_fields, decode_json_object, requested_model, DecodeError,
 };
@@ -141,6 +141,44 @@ pub struct GatewayError {
     pub kind: GatewayErrorKind,
     pub message: String,
     pub param: Option<String>,
+}
+
+/// Safe routing information retained for an attempt.
+///
+/// This is deliberately limited to configured target identity and the stable
+/// target-error classification. It contains neither request data nor provider
+/// credentials, URLs, or upstream response bodies, and is suitable for a
+/// later structured-logging boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRecord {
+    /// Zero-based position in the selected route.
+    pub route_index: usize,
+    pub provider: ProviderKind,
+    pub target_model: String,
+    pub outcome: AttemptOutcome,
+}
+
+/// The protocol-level outcome of one configured route entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    Succeeded,
+    Failed {
+        kind: TargetErrorKind,
+        upstream_status: Option<u16>,
+    },
+}
+
+/// The result of trying a complete route in its configured order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDispatch {
+    pub response: ChatResponse,
+    pub attempts: Vec<AttemptRecord>,
+}
+
+/// Safe attempt history when no target produced a response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteExhausted {
+    pub attempts: Vec<AttemptRecord>,
 }
 
 impl GatewayError {
@@ -315,20 +353,55 @@ impl Application {
             ));
         }
 
-        // This slice deliberately invokes only the first configured target.
         // The response is materialized by the adapter before this function
         // creates any successful HTTP response, preserving non-streaming
         // commitment semantics.
-        let target = route.targets[0].clone();
-        let provider = (self.provider_factory)(target);
-        match block_on(provider.complete(&canonical), &request.cancellation) {
-            Ok(Ok(response)) => json_response(200, serialize_chat_response(&response)),
-            Ok(Err(_)) | Err(()) => error_response(GatewayError::new(
+        match self.dispatch_route(route, &canonical, &request.cancellation) {
+            Ok(dispatch) => json_response(200, serialize_chat_response(&dispatch.response)),
+            Err(_) => error_response(GatewayError::new(
                 GatewayErrorKind::UpstreamExhausted,
                 "All configured upstream targets failed",
                 None,
             )),
         }
+    }
+
+    /// Try every configured entry once, in route order, until protocol success.
+    /// All [`TargetError`] kinds deliberately share the exact same advance
+    /// behavior. A downstream cancellation stops this loop immediately.
+    pub fn dispatch_route(
+        &self,
+        route: &crate::config::RuntimeRoute,
+        request: &crate::request::CanonicalRequest,
+        cancellation: &DownstreamCancellation,
+    ) -> Result<RouteDispatch, RouteExhausted> {
+        let mut attempts = Vec::with_capacity(route.targets.len());
+        for (route_index, target) in route.targets.iter().cloned().enumerate() {
+            let provider_kind = target.provider;
+            let target_model = target.model.clone();
+            let provider = (self.provider_factory)(target);
+            match block_on(provider.complete(request), cancellation) {
+                Ok(Ok(response)) => {
+                    attempts.push(AttemptRecord {
+                        route_index,
+                        provider: provider_kind,
+                        target_model,
+                        outcome: AttemptOutcome::Succeeded,
+                    });
+                    return Ok(RouteDispatch { response, attempts });
+                }
+                Ok(Err(error)) => attempts.push(failed_attempt(
+                    route_index,
+                    provider_kind,
+                    target_model,
+                    error,
+                )),
+                // Do not start another potentially billable upstream request
+                // after the downstream client has disconnected.
+                Err(()) => return Err(RouteExhausted { attempts }),
+            }
+        }
+        Err(RouteExhausted { attempts })
     }
 
     fn models_response(&self) -> HttpResponse {
@@ -347,6 +420,23 @@ impl Application {
         }
         body.push_str("]}");
         json_response(200, body)
+    }
+}
+
+fn failed_attempt(
+    route_index: usize,
+    provider: ProviderKind,
+    target_model: String,
+    error: TargetError,
+) -> AttemptRecord {
+    AttemptRecord {
+        route_index,
+        provider,
+        target_model,
+        outcome: AttemptOutcome::Failed {
+            kind: error.kind,
+            upstream_status: error.upstream_status,
+        },
     }
 }
 

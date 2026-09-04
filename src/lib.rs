@@ -30,8 +30,9 @@ pub use response::{
     StreamAssembler, ToolCall, ToolCallDelta, Usage,
 };
 pub use server::{
-    app, app_with_provider_factory, Application, DownstreamCancellation, GatewayError,
-    GatewayErrorKind, HttpRequest, HttpResponse, ProviderFactory,
+    app, app_with_provider_factory, Application, AttemptOutcome, AttemptRecord,
+    DownstreamCancellation, GatewayError, GatewayErrorKind, HttpRequest, HttpResponse,
+    ProviderFactory, RouteDispatch, RouteExhausted,
 };
 
 /// Returns the package version string.

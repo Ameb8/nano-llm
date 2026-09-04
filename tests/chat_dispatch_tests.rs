@@ -3,7 +3,7 @@ use nano_llm::{
     HttpRequest, Provider, ProviderFuture, ProviderStream, RuntimeConfig, RuntimeGeneralSettings,
     RuntimeRoute, RuntimeTarget, TargetError,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn target(suffix: &str) -> RuntimeTarget {
@@ -145,7 +145,7 @@ fn first_target_receives_one_immutable_canonical_request_and_full_success_is_ser
 }
 
 #[test]
-fn first_target_failure_is_a_safe_502_and_never_tries_a_fallback() {
+fn every_failed_route_entry_is_tried_once_before_the_safe_502() {
     let targets = Arc::new(Mutex::new(Vec::new()));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let application = application(
@@ -160,7 +160,282 @@ fn first_target_failure_is_a_safe_502_and_never_tries_a_fallback() {
 
     assert_eq!(response.status, 502);
     assert_eq!(response.body, br#"{"error":{"message":"All configured upstream targets failed","type":"server_error","param":null,"code":"upstream_exhausted"}}"#);
-    assert_eq!(*targets.lock().unwrap(), vec!["first"]);
+    assert_eq!(*targets.lock().unwrap(), vec!["first", "fallback"]);
+}
+
+#[derive(Clone)]
+enum SequencedOutcome {
+    Failure(TargetError),
+    Success(ChatResponse),
+}
+
+struct SequencedProvider(SequencedOutcome);
+
+impl Provider for SequencedProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        let outcome = self.0.clone();
+        Box::pin(async move {
+            match outcome {
+                SequencedOutcome::Failure(error) => Err(error),
+                SequencedOutcome::Success(response) => Ok(response),
+            }
+        })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+}
+
+fn sequenced_application(
+    outcomes: Vec<SequencedOutcome>,
+    seen: Arc<Mutex<Vec<String>>>,
+) -> nano_llm::Application {
+    let targets = (0..outcomes.len())
+        .map(|index| target(&format!("entry-{index}")))
+        .collect();
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets,
+        }],
+    };
+    let next = Arc::new(AtomicUsize::new(0));
+    app_with_provider_factory(
+        config,
+        true,
+        Arc::new(move |target| {
+            seen.lock().unwrap().push(target.model_suffix);
+            let index = next.fetch_add(1, Ordering::AcqRel);
+            Box::new(SequencedProvider(outcomes[index].clone()))
+        }),
+    )
+}
+
+fn successful_response(finish_reason: FinishReason) -> ChatResponse {
+    let tool_calls = (finish_reason == FinishReason::ToolCalls).then(|| {
+        vec![nano_llm::ToolCall {
+            id: "call_1".into(),
+            r#type: "function",
+            function: nano_llm::FunctionCall {
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        }]
+    });
+    ChatResponse {
+        id: "canonical-winner".into(),
+        object: "chat.completion",
+        created: 9,
+        model: "public".into(),
+        choices: vec![ChatChoice {
+            index: 0,
+            message: nano_llm::AssistantMessage {
+                role: "assistant",
+                content: (finish_reason != FinishReason::ToolCalls).then(|| "winner".into()),
+                tool_calls,
+            },
+            finish_reason,
+        }],
+        usage: None,
+    }
+}
+
+#[test]
+fn all_target_error_kinds_advance_identically_in_file_order() {
+    let errors = vec![
+        TargetError::timeout(),
+        TargetError::connection(),
+        TargetError::from_upstream_status(429),
+        TargetError::from_upstream_status(401),
+        TargetError::from_upstream_status(403),
+        TargetError::from_upstream_status(400),
+        TargetError::invalid_response(),
+        TargetError::overloaded(),
+        TargetError::from_upstream_status(500),
+    ];
+    let mut outcomes: Vec<_> = errors.into_iter().map(SequencedOutcome::Failure).collect();
+    outcomes.push(SequencedOutcome::Success(successful_response(
+        FinishReason::Stop,
+    )));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let application = sequenced_application(outcomes, seen.clone());
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+
+    assert_eq!(response.status, 200);
+    assert!(std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("canonical-winner"));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        (0..10)
+            .map(|index| format!("entry-{index}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn first_middle_and_final_protocol_success_stop_further_attempts() {
+    for winner in [0, 1, 2] {
+        let mut outcomes = vec![
+            SequencedOutcome::Failure(TargetError::connection()),
+            SequencedOutcome::Failure(TargetError::connection()),
+            SequencedOutcome::Failure(TargetError::connection()),
+        ];
+        outcomes[winner] = SequencedOutcome::Success(successful_response(FinishReason::Stop));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let application = sequenced_application(outcomes, seen.clone());
+
+        assert_eq!(
+            application
+                .handle(&chat(
+                    br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .status,
+            200
+        );
+        assert_eq!(seen.lock().unwrap().len(), winner + 1);
+    }
+}
+
+#[test]
+fn semantic_successes_never_fall_back() {
+    for finish_reason in [
+        FinishReason::ContentFilter,
+        FinishReason::Length,
+        FinishReason::ToolCalls,
+    ] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let application = sequenced_application(
+            vec![
+                SequencedOutcome::Success(successful_response(finish_reason)),
+                SequencedOutcome::Failure(TargetError::connection()),
+            ],
+            seen.clone(),
+        );
+        let response = application.handle(&chat(
+            br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+        ));
+        assert_eq!(response.status, 200);
+        assert_eq!(*seen.lock().unwrap(), vec!["entry-0"]);
+    }
+}
+
+#[test]
+fn natural_language_refusal_is_a_success_and_does_not_fall_back() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut refusal = successful_response(FinishReason::Stop);
+    refusal.choices[0].message.content = Some("I cannot comply with that request.".into());
+    let application = sequenced_application(
+        vec![
+            SequencedOutcome::Success(refusal),
+            SequencedOutcome::Failure(TargetError::connection()),
+        ],
+        seen.clone(),
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+    assert_eq!(response.status, 200);
+    assert!(std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("cannot comply"));
+    assert_eq!(*seen.lock().unwrap(), vec!["entry-0"]);
+}
+
+#[test]
+fn repeated_target_is_retried_only_as_a_second_route_entry_and_attempts_are_safe() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let application = sequenced_application(
+        vec![
+            SequencedOutcome::Failure(TargetError::from_upstream_status(429)),
+            SequencedOutcome::Success(successful_response(FinishReason::Stop)),
+        ],
+        seen.clone(),
+    );
+    let route = RuntimeRoute {
+        model_name: "public".into(),
+        targets: vec![target("same-target"), target("same-target")],
+    };
+    let canonical = nano_llm::decode_chat_request(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    )
+    .unwrap();
+
+    let dispatch = application
+        .dispatch_route(
+            &route,
+            &canonical,
+            &nano_llm::DownstreamCancellation::default(),
+        )
+        .expect("second route entry succeeds");
+
+    assert_eq!(*seen.lock().unwrap(), vec!["same-target", "same-target"]);
+    assert_eq!(dispatch.response.id, "canonical-winner");
+    assert_eq!(dispatch.attempts.len(), 2);
+    assert_eq!(dispatch.attempts[0].route_index, 0);
+    assert_eq!(dispatch.attempts[0].target_model, "openai/same-target");
+    assert_eq!(
+        dispatch.attempts[0].outcome,
+        nano_llm::AttemptOutcome::Failed {
+            kind: nano_llm::TargetErrorKind::RateLimited,
+            upstream_status: Some(429),
+        }
+    );
+    assert_eq!(
+        dispatch.attempts[1].outcome,
+        nano_llm::AttemptOutcome::Succeeded
+    );
+}
+
+#[test]
+fn exhausted_dispatch_retains_only_safe_attempt_metadata() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let application = sequenced_application(
+        vec![
+            SequencedOutcome::Failure(TargetError::connection()),
+            SequencedOutcome::Failure(TargetError::from_upstream_status(500)),
+        ],
+        seen,
+    );
+    let route = RuntimeRoute {
+        model_name: "public".into(),
+        targets: vec![target("first"), target("second")],
+    };
+    let canonical = nano_llm::decode_chat_request(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    )
+    .unwrap();
+
+    let exhausted = application
+        .dispatch_route(
+            &route,
+            &canonical,
+            &nano_llm::DownstreamCancellation::default(),
+        )
+        .expect_err("all targets fail");
+
+    assert_eq!(exhausted.attempts.len(), 2);
+    assert_eq!(exhausted.attempts[0].route_index, 0);
+    assert_eq!(exhausted.attempts[0].target_model, "openai/first");
+    assert_eq!(
+        exhausted.attempts[1].outcome,
+        nano_llm::AttemptOutcome::Failed {
+            kind: nano_llm::TargetErrorKind::UpstreamHttp,
+            upstream_status: Some(500),
+        }
+    );
 }
 
 #[test]

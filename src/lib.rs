@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod cli;
 pub mod config;
+pub mod gemini;
 pub mod openai_compatible;
 pub mod providers;
 pub mod request;
@@ -14,6 +15,7 @@ pub use config::{
     EnvLookupError, EnvProvider, ProviderKind, RawConfig, RuntimeConfig, RuntimeGeneralSettings,
     RuntimeRoute, RuntimeTarget, SecretString, SystemEnv,
 };
+pub use gemini::GeminiProvider;
 pub use openai_compatible::{
     OpenAiCompatibleProvider, OpenAiSseDecoder, MAX_BUFFERED_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
 };

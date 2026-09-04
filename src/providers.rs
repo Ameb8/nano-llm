@@ -6,6 +6,7 @@
 
 use crate::anthropic::AnthropicProvider;
 use crate::config::{ProviderKind, RuntimeTarget};
+use crate::gemini::GeminiProvider;
 use crate::openai_compatible::OpenAiCompatibleProvider;
 use crate::request::CanonicalRequest;
 use crate::response::{ChatChunk, ChatResponse};
@@ -317,7 +318,7 @@ pub fn build_provider_with_transport(
             Box::new(OpenAiCompatibleProvider::new(target, transport))
         }
         ProviderKind::Anthropic => Box::new(AnthropicProvider::new(target, transport)),
-        ProviderKind::Gemini => Box::new(TargetProvider::from_validated(target)),
+        ProviderKind::Gemini => Box::new(GeminiProvider::new(target, transport)),
     }
 }
 

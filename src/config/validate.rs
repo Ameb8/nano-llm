@@ -96,7 +96,9 @@ pub fn build_runtime_config<E: EnvProvider>(
         RuntimeGeneralSettings::default()
     };
 
-    // 2. Model list validation & route grouping
+    // 2. Model list validation and secret resolution. Keep entries flat until
+    // every target has passed semantic validation: route grouping is the final
+    // construction step, after all configured secrets have been resolved.
     if raw.model_list.is_empty() {
         return Err(ConfigError::new(
             ConfigErrorKind::EmptyModelList {
@@ -106,7 +108,7 @@ pub fn build_runtime_config<E: EnvProvider>(
         ));
     }
 
-    let mut routes: Vec<RuntimeRoute> = Vec::new();
+    let mut validated_entries: Vec<(String, RuntimeTarget)> = Vec::new();
 
     for (idx, entry) in raw.model_list.into_iter().enumerate() {
         // Validate model_name
@@ -194,13 +196,23 @@ pub fn build_runtime_config<E: EnvProvider>(
             explicit_timeout,
         };
 
-        // Group into routes preserving first appearance order of public model names
-        // and preserving target file order (no deduplication or load balancing).
-        if let Some(existing_route) = routes.iter_mut().find(|r| r.model_name == entry.model_name) {
+        validated_entries.push((entry.model_name, target));
+    }
+
+    // 3. Group only fully validated entries. A route is introduced on its first
+    // appearance, while every target retains its original file order. In
+    // particular, equal targets remain separate entries: priority routing never
+    // deduplicates or load-balances them.
+    let mut routes: Vec<RuntimeRoute> = Vec::new();
+    for (model_name, target) in validated_entries {
+        if let Some(existing_route) = routes
+            .iter_mut()
+            .find(|route| route.model_name == model_name)
+        {
             existing_route.targets.push(target);
         } else {
             routes.push(RuntimeRoute {
-                model_name: entry.model_name,
+                model_name,
                 targets: vec![target],
             });
         }

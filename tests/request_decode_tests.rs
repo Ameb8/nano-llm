@@ -1,6 +1,6 @@
 use nano_llm::{
     decode_chat_request, decode_chat_request_for_route, DecodeError, JsonValue, ProviderKind,
-    RuntimeRoute, RuntimeTarget,
+    RuntimeRoute, RuntimeTarget, ToolChoice,
 };
 
 fn valid_request(extra: &str) -> Vec<u8> {
@@ -12,6 +12,21 @@ fn validation(error: DecodeError) -> (Option<String>, String) {
     match error {
         DecodeError::Validation { param, message } => (param, message),
         other => panic!("expected validation error, got {other:?}"),
+    }
+}
+
+fn route_with(provider: ProviderKind) -> RuntimeRoute {
+    RuntimeRoute {
+        model_name: "test".into(),
+        targets: vec![RuntimeTarget {
+            model: "test/model".into(),
+            provider,
+            model_suffix: "model".into(),
+            api_key: None,
+            api_base: "https://example.test".into(),
+            timeout: 30,
+            explicit_timeout: None,
+        }],
     }
 }
 
@@ -94,7 +109,7 @@ fn unknown_members_are_rejected_at_each_gateway_defined_depth() {
         ),
         (
             valid_request(
-                r#", "tool_choice":{"type":"function","function":{"name":"x","extra":true}}"#,
+                r#", "tools":[{"type":"function","function":{"name":"x"}}],"tool_choice":{"type":"function","function":{"name":"x","extra":true}}"#,
             ),
             "tool_choice",
             "tool_choice.function",
@@ -209,7 +224,7 @@ fn instructions_and_conversation_turns_follow_the_portable_state_machine() {
 
     decode_chat_request(br#"{"model":"test","messages":[{"role":"user","content":"a"},{"role":"assistant","content":""},{"role":"user","content":"b"}]}"#)
         .expect("empty assistant text is valid and must be followed by a user turn");
-    decode_chat_request(br#"{"model":"test","messages":[{"role":"user","content":"a"},{"role":"assistant","content":null,"tool_calls":[{"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"x","content":"r"}]}"#)
+    decode_chat_request(br#"{"model":"test","messages":[{"role":"user","content":"a"},{"role":"assistant","content":null,"tool_calls":[{"id":"x","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"x","content":"r"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#)
         .expect("a complete tool-result group is a terminal user-side turn");
 }
 
@@ -245,4 +260,136 @@ fn stream_options_and_anthropic_output_limit_are_route_aware() {
     assert_eq!(param.as_deref(), Some("max_tokens"));
     decode_chat_request_for_route(&valid_request(r#", "max_tokens":1"#), &route)
         .expect("an Anthropic route accepts one output-token alias");
+}
+
+#[test]
+fn tools_and_choice_are_portable_and_normalized() {
+    let base = r#"{"model":"test","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"find_it","description":"","parameters":{"unrestricted":true}}}]}"#;
+    assert_eq!(
+        decode_chat_request(base.as_bytes()).unwrap().tool_choice,
+        ToolChoice::Auto
+    );
+
+    for (choice, expected) in [
+        (r#""none""#, ToolChoice::None),
+        (r#""auto""#, ToolChoice::Auto),
+        (r#""required""#, ToolChoice::Required),
+        (
+            r#"{"type":"function","function":{"name":"find_it"}}"#,
+            ToolChoice::Named("find_it".into()),
+        ),
+    ] {
+        let body = format!("{},\"tool_choice\":{choice}}}", &base[..base.len() - 1]);
+        assert_eq!(
+            decode_chat_request(body.as_bytes()).unwrap().tool_choice,
+            expected
+        );
+    }
+    assert_eq!(
+        decode_chat_request(&valid_request("")).unwrap().tool_choice,
+        ToolChoice::None
+    );
+
+    for body in [
+        valid_request(r#", "tools":[]"#),
+        valid_request(
+            r#", "tools":[{"type":"function","function":{"name":"same"}},{"type":"function","function":{"name":"same"}}]"#,
+        ),
+        valid_request(r#", "tools":[{"type":"function","function":{"name":"not valid"}}]"#),
+        valid_request(r#", "tools":[{"type":"other","function":{"name":"ok"}}]"#),
+        valid_request(
+            r#", "tools":[{"type":"function","function":{"name":"ok","parameters":[]}}]"#,
+        ),
+        valid_request(r#", "tool_choice":"auto""#),
+        valid_request(
+            r#", "tools":[{"type":"function","function":{"name":"ok"}}],"tool_choice":"sometimes""#,
+        ),
+        valid_request(
+            r#", "tools":[{"type":"function","function":{"name":"ok"}}],"tool_choice":{"type":"function","function":{"name":"missing"}}"#,
+        ),
+    ] {
+        assert!(decode_chat_request(&body).is_err(), "{body:?}");
+    }
+}
+
+#[test]
+fn tool_call_history_requires_declared_unique_calls_and_complete_result_groups() {
+    let valid = r#"{
+      "model":"test",
+      "tools":[{"type":"function","function":{"name":"first"}},{"type":"function","function":{"name":"second"}}],
+      "messages":[
+        {"role":"user","content":"question"},
+        {"role":"assistant","tool_calls":[
+          {"id":"one","type":"function","function":{"name":"first","arguments":"{}"}},
+          {"id":"two","type":"function","function":{"name":"second","arguments":"{}"}}
+        ]},
+        {"role":"tool","tool_call_id":"two","content":"second result"},
+        {"role":"tool","tool_call_id":"one","content":"first result"}
+      ]
+    }"#;
+    decode_chat_request(valid.as_bytes()).expect("results may resolve calls out of call order");
+
+    let cases = [
+        r#"{"model":"test","tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"id":"","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"","content":"r"}]}"#,
+        r#"{"model":"test","tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"id":"id","type":"function","function":{"name":"missing","arguments":"{}"}}]},{"role":"tool","tool_call_id":"id","content":"r"}]}"#,
+        r#"{"model":"test","tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"id":"id","type":"function","function":{"name":"f","arguments":"{}"}},{"id":"id","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"id","content":"r"}]}"#,
+        r#"{"model":"test","tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"id":"id","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"other","content":"r"}]}"#,
+        r#"{"model":"test","tools":[{"type":"function","function":{"name":"f"}},{"type":"function","function":{"name":"g"}}],"messages":[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"id":"one","type":"function","function":{"name":"f","arguments":"{}"}},{"id":"two","type":"function","function":{"name":"g","arguments":"{}"}}]},{"role":"tool","tool_call_id":"one","content":"r"}]}"#,
+        r#"{"model":"test","tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"id":"id","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"id","content":"r"},{"role":"assistant","tool_calls":[{"id":"id","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"id","content":"r"}]}"#,
+    ];
+    for body in cases {
+        let (param, _) = validation(decode_chat_request(body.as_bytes()).unwrap_err());
+        assert_eq!(param.as_deref(), Some("messages"));
+    }
+}
+
+#[test]
+fn native_argument_routes_require_one_object_without_rewriting_compatible_strings() {
+    let body = r#"{"model":"test","max_tokens":1,"tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"id":"id","type":"function","function":{"name":"f","arguments":" { \"x\" : 1 } "}}]},{"role":"tool","tool_call_id":"id","content":"r"}]}"#;
+    let compatible =
+        decode_chat_request_for_route(body.as_bytes(), &route_with(ProviderKind::OpenAi))
+            .expect("OpenAI-compatible routes preserve opaque argument strings");
+    let JsonValue::Array(ref messages) = compatible
+        .fields
+        .iter()
+        .find(|(key, _)| key == "messages")
+        .unwrap()
+        .1
+    else {
+        panic!()
+    };
+    let JsonValue::Object(assistant) = &messages[1] else {
+        panic!()
+    };
+    let JsonValue::Array(ref calls) = assistant
+        .iter()
+        .find(|(key, _)| key == "tool_calls")
+        .unwrap()
+        .1
+    else {
+        panic!()
+    };
+    let JsonValue::Object(call) = &calls[0] else {
+        panic!()
+    };
+    let JsonValue::Object(ref function) = call.iter().find(|(key, _)| key == "function").unwrap().1
+    else {
+        panic!()
+    };
+    assert!(
+        matches!(function.iter().find(|(key, _)| key == "arguments").unwrap().1, JsonValue::String(ref value) if value == " { \"x\" : 1 } ")
+    );
+    decode_chat_request_for_route(body.as_bytes(), &route_with(ProviderKind::Gemini))
+        .expect("native-object route accepts exactly one object");
+    decode_chat_request_for_route(body.as_bytes(), &route_with(ProviderKind::Anthropic))
+        .expect("native-object route accepts exactly one object");
+
+    for arguments in ["[]", "null", "{} trailing", "{", "{} {}"] {
+        let invalid = body.replacen(" { \\\"x\\\" : 1 } ", arguments, 1);
+        let (param, _) = validation(
+            decode_chat_request_for_route(invalid.as_bytes(), &route_with(ProviderKind::Anthropic))
+                .unwrap_err(),
+        );
+        assert_eq!(param.as_deref(), Some("messages"), "{arguments}");
+    }
 }

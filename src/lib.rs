@@ -10,6 +10,7 @@ pub use config::{
 };
 pub use request::{
     decode_chat_request, decode_chat_request_for_route, CanonicalRequest, DecodeError, JsonValue,
+    ToolChoice,
 };
 
 /// Returns the package version string.

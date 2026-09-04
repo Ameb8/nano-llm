@@ -4,6 +4,7 @@
 //! duplicate members before validation can report them.
 
 use crate::config::{ProviderKind, RuntimeRoute};
+use std::collections::HashSet;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,8 +19,19 @@ pub struct CanonicalRequest {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub stop: Option<Vec<String>>,
+    /// Provider-neutral tool selection, including the default selected by the
+    /// presence (or absence) of `tools`.
+    pub tool_choice: ToolChoice,
     /// Leading `system` and `developer` content, joined with exactly `\n\n`.
     pub instruction: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoice {
+    None,
+    Auto,
+    Required,
+    Named(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +136,14 @@ impl CanonicalRequest {
                 "'max_tokens' or 'max_completion_tokens' is required for routes containing Anthropic targets",
             ));
         }
+        if route.targets.iter().any(|target| {
+            matches!(
+                target.provider,
+                ProviderKind::Anthropic | ProviderKind::Gemini
+            )
+        }) {
+            validate_route_tool_arguments(&self.fields)?;
+        }
         Ok(())
     }
 }
@@ -171,6 +191,7 @@ fn canonicalize(fields: Vec<(String, JsonValue)>) -> Result<CanonicalRequest, De
         _ => unreachable!("validate_top validates stop"),
     };
     let instruction = combined_instruction(field(&fields, "messages").unwrap());
+    let tool_choice = canonical_tool_choice(&fields);
     Ok(CanonicalRequest {
         fields,
         model,
@@ -180,8 +201,32 @@ fn canonicalize(fields: Vec<(String, JsonValue)>) -> Result<CanonicalRequest, De
         temperature,
         top_p,
         stop,
+        tool_choice,
         instruction,
     })
+}
+
+fn canonical_tool_choice(fields: &[(String, JsonValue)]) -> ToolChoice {
+    match field(fields, "tool_choice") {
+        None if field(fields, "tools").is_some() => ToolChoice::Auto,
+        None => ToolChoice::None,
+        Some(JsonValue::String(choice)) => match choice.as_str() {
+            "none" => ToolChoice::None,
+            "auto" => ToolChoice::Auto,
+            "required" => ToolChoice::Required,
+            _ => unreachable!("validate_top validates tool_choice"),
+        },
+        Some(JsonValue::Object(choice)) => {
+            let JsonValue::Object(function) = field(choice, "function").unwrap() else {
+                unreachable!("validate_top validates tool_choice")
+            };
+            let JsonValue::String(name) = field(function, "name").unwrap() else {
+                unreachable!("validate_top validates tool_choice")
+            };
+            ToolChoice::Named(name.clone())
+        }
+        _ => unreachable!("validate_top validates tool_choice"),
+    }
 }
 
 fn positive_i32(value: &JsonValue, param: &str) -> Result<u32, DecodeError> {
@@ -361,7 +406,11 @@ fn validate_top(fields: &[(String, JsonValue)]) -> Result<(), DecodeError> {
         }
     }
     string(field(fields, "model").unwrap(), "model", "model")?;
-    validate_messages(field(fields, "messages").unwrap())?;
+    let tool_names = match field(fields, "tools") {
+        Some(value) => validate_tools(value)?,
+        None => Vec::new(),
+    };
+    validate_messages(field(fields, "messages").unwrap(), &tool_names)?;
     let stream = match field(fields, "stream") {
         Some(value) => {
             boolean(value, "stream", "stream")?;
@@ -378,11 +427,14 @@ fn validate_top(fields: &[(String, JsonValue)]) -> Result<(), DecodeError> {
         }
         validate_stream_options(value)?;
     }
-    if let Some(value) = field(fields, "tools") {
-        validate_tools(value)?;
-    }
     if let Some(value) = field(fields, "tool_choice") {
-        validate_tool_choice(value)?;
+        if tool_names.is_empty() {
+            return Err(validation(
+                Some("tool_choice"),
+                "'tool_choice' requires at least one declared tool",
+            ));
+        }
+        validate_tool_choice(value, &tool_names)?;
     }
     for key in [
         "max_tokens",
@@ -442,7 +494,53 @@ fn validate_stop_string(value: &str, path: &str) -> Result<(), DecodeError> {
     Ok(())
 }
 
-fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
+/// Anthropic and Gemini require structured function-call arguments.  The raw
+/// canonical strings stay in `fields`; this pass only proves that each can be
+/// consumed as one object by those adapter families.
+fn validate_route_tool_arguments(fields: &[(String, JsonValue)]) -> Result<(), DecodeError> {
+    let JsonValue::Array(messages) = field(fields, "messages").unwrap() else {
+        unreachable!("validate_top validates messages")
+    };
+    for (message_index, message) in messages.iter().enumerate() {
+        let JsonValue::Object(message) = message else {
+            unreachable!()
+        };
+        let Some(JsonValue::Array(calls)) = field(message, "tool_calls") else {
+            continue;
+        };
+        for (call_index, call) in calls.iter().enumerate() {
+            let JsonValue::Object(call) = call else {
+                unreachable!()
+            };
+            let JsonValue::Object(function) = field(call, "function").unwrap() else {
+                unreachable!()
+            };
+            let JsonValue::String(arguments) = field(function, "arguments").unwrap() else {
+                unreachable!()
+            };
+            let path =
+                format!("messages[{message_index}].tool_calls[{call_index}].function.arguments");
+            let mut parser = Parser::new(arguments);
+            parser.ws();
+            let parsed = parser.value(&path, Some("messages")).map_err(|_| {
+                validation(
+                    Some("messages"),
+                    format!("'{path}' must contain exactly one JSON object"),
+                )
+            })?;
+            parser.ws();
+            if !parser.eof() || !matches!(parsed, JsonValue::Object(_)) {
+                return Err(validation(
+                    Some("messages"),
+                    format!("'{path}' must contain exactly one JSON object"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_messages(value: &JsonValue, tool_names: &[String]) -> Result<(), DecodeError> {
     let messages = array(value, "messages", "messages")?;
     if messages.is_empty() {
         return Err(validation(
@@ -451,6 +549,8 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
         ));
     }
     let mut state = TurnState::Instruction;
+    let mut call_ids = HashSet::new();
+    let mut unresolved = HashSet::new();
     for (index, value) in messages.iter().enumerate() {
         let path = path_index("messages", index);
         let fields = object(value, "messages", &path)?;
@@ -525,7 +625,8 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
                     }
                 }
                 if let Some(calls) = field(fields, "tool_calls") {
-                    validate_tool_calls(calls, &path)?;
+                    let calls = validate_tool_calls(calls, &path, tool_names, &mut call_ids)?;
+                    unresolved.extend(calls);
                 }
                 let has_content = matches!(field(fields, "content"), Some(JsonValue::String(_)));
                 let has_calls = field(fields, "tool_calls").is_some();
@@ -535,7 +636,7 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
                         format!("'{path}' must contain string content and/or nonempty tool_calls"),
                     ));
                 }
-                if state != TurnState::AfterUser {
+                if !matches!(state, TurnState::AfterUser | TurnState::AfterToolResult) {
                     return Err(validation(
                         Some("messages"),
                         format!("unexpected assistant message at '{path}'"),
@@ -566,7 +667,23 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
                         format!("unexpected tool result at '{path}'"),
                     ));
                 }
-                state = TurnState::AfterToolResult;
+                let call_id = match field(fields, "tool_call_id").unwrap() {
+                    JsonValue::String(value) => value,
+                    _ => unreachable!(),
+                };
+                if !unresolved.remove(call_id) {
+                    return Err(validation(
+                        Some("messages"),
+                        format!(
+                            "'{path}.tool_call_id' does not resolve an immediately preceding call"
+                        ),
+                    ));
+                }
+                state = if unresolved.is_empty() {
+                    TurnState::AfterToolResult
+                } else {
+                    TurnState::ToolResults
+                };
                 string(
                     field(fields, "content").unwrap(),
                     "messages",
@@ -599,7 +716,12 @@ enum TurnState {
     AfterToolResult,
 }
 
-fn validate_tool_calls(value: &JsonValue, parent: &str) -> Result<(), DecodeError> {
+fn validate_tool_calls(
+    value: &JsonValue,
+    parent: &str,
+    tool_names: &[String],
+    call_ids: &mut HashSet<String>,
+) -> Result<Vec<String>, DecodeError> {
     let calls = array(value, "messages", &path_member(parent, "tool_calls"))?;
     if calls.is_empty() {
         return Err(validation(
@@ -607,6 +729,7 @@ fn validate_tool_calls(value: &JsonValue, parent: &str) -> Result<(), DecodeErro
             format!("'{parent}.tool_calls' must be nonempty"),
         ));
     }
+    let mut ids = Vec::with_capacity(calls.len());
     for (index, value) in calls.iter().enumerate() {
         let path = path_index(&path_member(parent, "tool_calls"), index);
         let fields = object(value, "messages", &path)?;
@@ -617,26 +740,46 @@ fn validate_tool_calls(value: &JsonValue, parent: &str) -> Result<(), DecodeErro
             "messages",
             &path,
         )?;
-        string(
-            field(fields, "id").unwrap(),
-            "messages",
-            &path_member(&path, "id"),
-        )?;
-        string(
-            field(fields, "type").unwrap(),
-            "messages",
-            &path_member(&path, "type"),
-        )?;
-        validate_call_function(
+        let id_path = path_member(&path, "id");
+        string(field(fields, "id").unwrap(), "messages", &id_path)?;
+        let JsonValue::String(id) = field(fields, "id").unwrap() else {
+            unreachable!()
+        };
+        if id.is_empty() || !call_ids.insert(id.clone()) {
+            return Err(validation(
+                Some("messages"),
+                format!("'{id_path}' must be a globally unique nonempty call ID"),
+            ));
+        }
+        let type_path = path_member(&path, "type");
+        string(field(fields, "type").unwrap(), "messages", &type_path)?;
+        if !matches!(field(fields, "type"), Some(JsonValue::String(kind)) if kind == "function") {
+            return Err(validation(
+                Some("messages"),
+                format!("'{type_path}' must be 'function'"),
+            ));
+        }
+        let name = validate_call_function(
             field(fields, "function").unwrap(),
             "messages",
             &path_member(&path, "function"),
         )?;
+        if !tool_names.iter().any(|declared| declared == name) {
+            return Err(validation(
+                Some("messages"),
+                format!("'{}.function.name' must name a declared tool", path),
+            ));
+        }
+        ids.push(id.clone());
     }
-    Ok(())
+    Ok(ids)
 }
 
-fn validate_call_function(value: &JsonValue, param: &str, path: &str) -> Result<(), DecodeError> {
+fn validate_call_function<'a>(
+    value: &'a JsonValue,
+    param: &str,
+    path: &str,
+) -> Result<&'a str, DecodeError> {
     let fields = object(value, param, path)?;
     closed(
         fields,
@@ -645,20 +788,28 @@ fn validate_call_function(value: &JsonValue, param: &str, path: &str) -> Result<
         param,
         path,
     )?;
-    string(
-        field(fields, "name").unwrap(),
-        param,
-        &path_member(path, "name"),
-    )?;
+    let name_path = path_member(path, "name");
+    string(field(fields, "name").unwrap(), param, &name_path)?;
     string(
         field(fields, "arguments").unwrap(),
         param,
         &path_member(path, "arguments"),
-    )
+    )?;
+    let JsonValue::String(name) = field(fields, "name").unwrap() else {
+        unreachable!()
+    };
+    Ok(name)
 }
 
-fn validate_tools(value: &JsonValue) -> Result<(), DecodeError> {
+fn validate_tools(value: &JsonValue) -> Result<Vec<String>, DecodeError> {
     let tools = array(value, "tools", "tools")?;
+    if tools.is_empty() {
+        return Err(validation(
+            Some("tools"),
+            "'tools' must be a nonempty array",
+        ));
+    }
+    let mut names = Vec::with_capacity(tools.len());
     for (index, value) in tools.iter().enumerate() {
         let path = path_index("tools", index);
         let fields = object(value, "tools", &path)?;
@@ -669,11 +820,14 @@ fn validate_tools(value: &JsonValue) -> Result<(), DecodeError> {
             "tools",
             &path,
         )?;
-        string(
-            field(fields, "type").unwrap(),
-            "tools",
-            &path_member(&path, "type"),
-        )?;
+        let type_path = path_member(&path, "type");
+        string(field(fields, "type").unwrap(), "tools", &type_path)?;
+        if !matches!(field(fields, "type"), Some(JsonValue::String(kind)) if kind == "function") {
+            return Err(validation(
+                Some("tools"),
+                format!("'{type_path}' must be 'function'"),
+            ));
+        }
         let function_path = path_member(&path, "function");
         let function = object(field(fields, "function").unwrap(), "tools", &function_path)?;
         closed(
@@ -683,11 +837,18 @@ fn validate_tools(value: &JsonValue) -> Result<(), DecodeError> {
             "tools",
             &function_path,
         )?;
-        string(
-            field(function, "name").unwrap(),
-            "tools",
-            &path_member(&function_path, "name"),
-        )?;
+        let name_path = path_member(&function_path, "name");
+        string(field(function, "name").unwrap(), "tools", &name_path)?;
+        let JsonValue::String(name) = field(function, "name").unwrap() else {
+            unreachable!()
+        };
+        if !valid_tool_name(name) || names.iter().any(|seen| seen == name) {
+            return Err(validation(
+                Some("tools"),
+                format!("'{name_path}' must be a unique name matching [A-Za-z0-9_-]{{1,64}}"),
+            ));
+        }
+        names.push(name.clone());
         if let Some(description) = field(function, "description") {
             string(
                 description,
@@ -703,12 +864,26 @@ fn validate_tools(value: &JsonValue) -> Result<(), DecodeError> {
             )?;
         }
     }
-    Ok(())
+    Ok(names)
 }
 
-fn validate_tool_choice(value: &JsonValue) -> Result<(), DecodeError> {
-    if matches!(value, JsonValue::String(_)) {
-        return Ok(());
+fn valid_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn validate_tool_choice(value: &JsonValue, tool_names: &[String]) -> Result<(), DecodeError> {
+    if let JsonValue::String(choice) = value {
+        return matches!(choice.as_str(), "none" | "auto" | "required")
+            .then_some(())
+            .ok_or_else(|| {
+                validation(
+                    Some("tool_choice"),
+                    "'tool_choice' must be 'none', 'auto', 'required', or a named function",
+                )
+            });
     }
     let fields = object(value, "tool_choice", "tool_choice")?;
     closed(
@@ -723,6 +898,12 @@ fn validate_tool_choice(value: &JsonValue) -> Result<(), DecodeError> {
         "tool_choice",
         "tool_choice.type",
     )?;
+    if !matches!(field(fields, "type"), Some(JsonValue::String(kind)) if kind == "function") {
+        return Err(validation(
+            Some("tool_choice"),
+            "'tool_choice.type' must be 'function'",
+        ));
+    }
     let function = object(
         field(fields, "function").unwrap(),
         "tool_choice",
@@ -739,7 +920,17 @@ fn validate_tool_choice(value: &JsonValue) -> Result<(), DecodeError> {
         field(function, "name").unwrap(),
         "tool_choice",
         "tool_choice.function.name",
-    )
+    )?;
+    let JsonValue::String(name) = field(function, "name").unwrap() else {
+        unreachable!()
+    };
+    if !tool_names.iter().any(|declared| declared == name) {
+        return Err(validation(
+            Some("tool_choice"),
+            "'tool_choice.function.name' must name a declared tool",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_stream_options(value: &JsonValue) -> Result<(), DecodeError> {

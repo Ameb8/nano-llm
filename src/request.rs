@@ -89,8 +89,33 @@ impl std::error::Error for DecodeError {}
 /// except that JSON syntax and duplicate-member checks still apply there.
 pub fn decode_chat_request(bytes: &[u8]) -> Result<CanonicalRequest, DecodeError> {
     let fields = decode_json_object(bytes)?;
+    decode_chat_request_fields(fields)
+}
+
+/// Canonicalize a JSON object that has already passed complete JSON ingestion.
+///
+/// Keeping this separate lets the HTTP perimeter resolve the public model from
+/// the fully parsed object before applying route-aware semantics, without
+/// parsing the request body a second time.
+pub fn decode_chat_request_fields(
+    fields: Vec<(String, JsonValue)>,
+) -> Result<CanonicalRequest, DecodeError> {
     validate_top(&fields)?;
     canonicalize(fields)
+}
+
+/// Extract the requested public model from a fully parsed JSON object.
+///
+/// This intentionally performs only the minimum safe shape check needed for
+/// route selection. Full canonical validation remains a single later step.
+pub fn requested_model(fields: &[(String, JsonValue)]) -> Result<String, DecodeError> {
+    match field(fields, "model") {
+        Some(JsonValue::String(model)) if !model.is_empty() => Ok(model.clone()),
+        _ => Err(validation(
+            Some("model"),
+            "'model' is required and must be a nonempty string",
+        )),
+    }
 }
 
 /// Decode exactly one UTF-8 JSON object without applying chat semantics.

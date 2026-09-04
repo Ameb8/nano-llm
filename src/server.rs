@@ -1,7 +1,11 @@
 //! Dependency-free inbound HTTP contract and router-level test seam.
 
 use crate::config::RuntimeConfig;
-use crate::request::{decode_json_object, DecodeError};
+use crate::providers::{build_provider, Provider};
+use crate::request::{
+    decode_chat_request_fields, decode_json_object, requested_model, DecodeError,
+};
+use crate::response::{ChatResponse, ToolCall};
 use std::fmt::Write;
 use std::fs::File;
 use std::io::Read;
@@ -22,6 +26,31 @@ pub struct HttpRequest {
     /// Fully buffered inbound body at this dependency-free router seam.
     pub body: Vec<u8>,
     body_chunks: Option<Vec<(Duration, Vec<u8>)>>,
+    cancellation: DownstreamCancellation,
+}
+
+/// A transport-owned signal that the downstream peer has disconnected.
+/// Dropping the in-flight provider future when this becomes cancelled gives
+/// transports a single, explicit cancellation boundary.
+#[derive(Debug, Clone, Default)]
+pub struct DownstreamCancellation(Arc<std::sync::atomic::AtomicBool>);
+
+impl PartialEq for DownstreamCancellation {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for DownstreamCancellation {}
+
+impl DownstreamCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 impl HttpRequest {
@@ -32,6 +61,7 @@ impl HttpRequest {
             headers: Vec::new(),
             body: Vec::new(),
             body_chunks: None,
+            cancellation: DownstreamCancellation::default(),
         }
     }
 
@@ -55,6 +85,12 @@ impl HttpRequest {
         I: IntoIterator<Item = (Duration, Vec<u8>)>,
     {
         self.body_chunks = Some(chunks.into_iter().collect());
+        self
+    }
+
+    /// Attach the downstream disconnect signal supplied by a transport.
+    pub fn with_downstream_cancellation(mut self, cancellation: DownstreamCancellation) -> Self {
+        self.cancellation = cancellation;
         self
     }
 
@@ -152,15 +188,32 @@ pub struct Application {
     config: RuntimeConfig,
     no_auth: bool,
     generation_capacity: Arc<GenerationCapacity>,
+    provider_factory: Arc<ProviderFactory>,
 }
+
+/// Constructs one target-bound provider after routing has selected its target.
+/// The factory is an application seam: routing sees only canonical requests and
+/// providers never see route selection or inbound HTTP details.
+pub type ProviderFactory = dyn Fn(crate::config::RuntimeTarget) -> Box<dyn Provider> + Send + Sync;
 
 /// Construct an application from immutable, validated configuration.
 pub fn app(config: RuntimeConfig, no_auth: bool) -> Application {
+    app_with_provider_factory(config, no_auth, Arc::new(build_provider))
+}
+
+/// Construct an application with an adapter factory. This is primarily useful
+/// for a transport-backed server runtime and deterministic integration tests.
+pub fn app_with_provider_factory(
+    config: RuntimeConfig,
+    no_auth: bool,
+    provider_factory: Arc<ProviderFactory>,
+) -> Application {
     let max_in_flight = config.general_settings.max_in_flight;
     Application {
         config,
         no_auth,
         generation_capacity: Arc::new(GenerationCapacity::new(max_in_flight)),
+        provider_factory,
     }
 }
 
@@ -232,18 +285,50 @@ impl Application {
                 ))
             }
         };
-        if let Err(error) = decode_json_object(&body) {
+        let fields = match decode_json_object(&body) {
+            Ok(fields) => fields,
+            Err(error) => return decode_error_response(error),
+        };
+        let model = match requested_model(&fields) {
+            Ok(model) => model,
+            Err(error) => return decode_error_response(error),
+        };
+        let Some(route) = self.config.get_route(&model) else {
+            return error_response(GatewayError::new(
+                GatewayErrorKind::ModelNotFound,
+                "Model not found",
+                Some("model".into()),
+            ));
+        };
+        let canonical = match decode_chat_request_fields(fields) {
+            Ok(request) => request,
+            Err(error) => return decode_error_response(error),
+        };
+        if let Err(error) = canonical.validate_for_route(route) {
             return decode_error_response(error);
         }
+        if canonical.stream {
+            return error_response(GatewayError::new(
+                GatewayErrorKind::InvalidRequest,
+                "Streaming is not supported",
+                Some("stream".into()),
+            ));
+        }
 
-        // Canonical semantic validation, routing, and provider dispatch are
-        // intentionally subsequent slices. Holding `_permit` through this
-        // terminal path verifies its lifetime boundary now.
-        error_response(GatewayError::new(
-            GatewayErrorKind::UpstreamExhausted,
-            "All configured upstream targets failed",
-            None,
-        ))
+        // This slice deliberately invokes only the first configured target.
+        // The response is materialized by the adapter before this function
+        // creates any successful HTTP response, preserving non-streaming
+        // commitment semantics.
+        let target = route.targets[0].clone();
+        let provider = (self.provider_factory)(target);
+        match block_on(provider.complete(&canonical), &request.cancellation) {
+            Ok(Ok(response)) => json_response(200, serialize_chat_response(&response)),
+            Ok(Err(_)) | Err(()) => error_response(GatewayError::new(
+                GatewayErrorKind::UpstreamExhausted,
+                "All configured upstream targets failed",
+                None,
+            )),
+        }
     }
 
     fn models_response(&self) -> HttpResponse {
@@ -431,6 +516,92 @@ fn error_response(error: GatewayError) -> HttpResponse {
     json_response(status, format!("{{\"error\":{{\"message\":\"{}\",\"type\":\"{error_type}\",\"param\":{param},\"code\":\"{code}\"}}}}", json_escape(&error.message)))
 }
 
+/// Encode the already validated canonical completion. This happens only after
+/// a provider has returned its complete response, so no partial success can be
+/// committed if provider response validation fails.
+fn serialize_chat_response(response: &ChatResponse) -> String {
+    let mut body = format!(
+        "{{\"id\":\"{}\",\"object\":\"{}\",\"created\":{},\"model\":\"{}\",\"choices\":[",
+        json_escape(&response.id),
+        response.object,
+        response.created,
+        json_escape(&response.model),
+    );
+    for (index, choice) in response.choices.iter().enumerate() {
+        if index != 0 {
+            body.push(',');
+        }
+        body.push_str(&format!(
+            "{{\"index\":{},\"message\":{{\"role\":\"assistant\",\"content\":{}",
+            choice.index,
+            choice
+                .message
+                .content
+                .as_deref()
+                .map(|value| format!("\"{}\"", json_escape(value)))
+                .unwrap_or_else(|| "null".into())
+        ));
+        if let Some(calls) = &choice.message.tool_calls {
+            body.push_str(",\"tool_calls\":[");
+            for (call_index, call) in calls.iter().enumerate() {
+                if call_index != 0 {
+                    body.push(',');
+                }
+                serialize_tool_call(&mut body, call);
+            }
+            body.push(']');
+        }
+        body.push_str(&format!(
+            "}},\"finish_reason\":\"{}\"}}",
+            choice.finish_reason.as_str()
+        ));
+    }
+    body.push(']');
+    if let Some(usage) = &response.usage {
+        body.push_str(&format!(
+            ",\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}",
+            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+        ));
+    }
+    body.push('}');
+    body
+}
+
+fn serialize_tool_call(body: &mut String, call: &ToolCall) {
+    body.push_str(&format!(
+        "{{\"id\":\"{}\",\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+        json_escape(&call.id),
+        json_escape(&call.function.name),
+        json_escape(&call.function.arguments),
+    ));
+}
+
+fn block_on<T>(
+    mut future: crate::providers::ProviderFuture<'_, T>,
+    cancellation: &DownstreamCancellation,
+) -> Result<T, ()> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn no_op(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut context = Context::from_waker(&waker);
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(());
+        }
+        match Pin::new(&mut future).poll(&mut context) {
+            Poll::Ready(value) => return Ok(value),
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
 fn json_response(status: u16, body: String) -> HttpResponse {
     HttpResponse {
         status,
@@ -515,7 +686,7 @@ mod tests {
             .with_header("authorization", "Bearer master-key")
             .with_header("authorization", "Bearer master-key");
         assert_eq!(application.handle(&repeated).status, 401);
-        assert_eq!(application.handle(&chat()).status, 502);
+        assert_eq!(application.handle(&chat()).status, 400);
     }
 
     #[test]
@@ -539,7 +710,7 @@ mod tests {
             .with_header("authorization", "bEaReR master-key")
             .with_header("content-type", "APPLICATION/JSON; CHARSET=UTF-8")
             .with_body(br#"{}"#.to_vec());
-        assert_eq!(application.handle(&charset).status, 502);
+        assert_eq!(application.handle(&charset).status, 400);
     }
 
     #[test]

@@ -20,8 +20,8 @@ pub use providers::{
     TransportTlsVerification,
 };
 pub use request::{
-    decode_chat_request, decode_chat_request_for_route, decode_json_object, CanonicalRequest,
-    DecodeError, JsonValue, ToolChoice,
+    decode_chat_request, decode_chat_request_fields, decode_chat_request_for_route,
+    decode_json_object, requested_model, CanonicalRequest, DecodeError, JsonValue, ToolChoice,
 };
 pub use response::{
     build_response, normalize_response, normalize_usage, safety_response, AssistantDelta,
@@ -29,7 +29,10 @@ pub use response::{
     NativeChoice, NativeResponse, NativeTerminal, NativeToolCall, ResponseError, ResponseMetadata,
     StreamAssembler, ToolCall, ToolCallDelta, Usage,
 };
-pub use server::{app, Application, GatewayError, GatewayErrorKind, HttpRequest, HttpResponse};
+pub use server::{
+    app, app_with_provider_factory, Application, DownstreamCancellation, GatewayError,
+    GatewayErrorKind, HttpRequest, HttpResponse, ProviderFactory,
+};
 
 /// Returns the package version string.
 pub fn version() -> &'static str {

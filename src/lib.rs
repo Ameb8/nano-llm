@@ -32,7 +32,8 @@ pub use response::{
 pub use server::{
     app, app_with_provider_factory, app_with_provider_factory_and_clock, Application,
     AttemptOutcome, AttemptRecord, DownstreamCancellation, GatewayError, GatewayErrorKind,
-    HttpRequest, HttpResponse, MonotonicClock, ProviderFactory, RouteDispatch, RouteExhausted,
+    HttpRequest, HttpResponse, MonotonicClock, ProviderFactory, RouteDiagnostics, RouteDispatch,
+    RouteExhausted,
 };
 
 /// Returns the package version string.

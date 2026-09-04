@@ -162,10 +162,26 @@ pub struct AttemptRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
     Succeeded,
+    /// The downstream peer disconnected while this target operation was
+    /// active. This is terminal for the route, not a target failure.
+    Cancelled,
     Failed {
         kind: TargetErrorKind,
         upstream_status: Option<u16>,
     },
+}
+
+/// The complete safe context retained by routing for a later diagnostics or
+/// logging boundary. It intentionally has no URL, credential, request body,
+/// upstream error object, response body, or provider-supplied message field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDiagnostics {
+    pub requested_model: String,
+    pub selected_provider: Option<ProviderKind>,
+    pub selected_model: Option<String>,
+    pub attempt_count: usize,
+    pub error_kind: Option<TargetErrorKind>,
+    pub upstream_status: Option<u16>,
 }
 
 /// The result of trying a complete route in its configured order.
@@ -173,15 +189,19 @@ pub enum AttemptOutcome {
 pub struct RouteDispatch {
     pub response: ChatResponse,
     pub attempts: Vec<AttemptRecord>,
+    pub diagnostics: RouteDiagnostics,
 }
 
 /// Safe attempt history when no target produced a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteExhausted {
     pub attempts: Vec<AttemptRecord>,
+    pub diagnostics: RouteDiagnostics,
     /// True when the route-wide deadline elapsed. In that case no later
     /// target was started, even if entries remain in the configured route.
     pub overall_timeout: bool,
+    /// The downstream peer disconnected; no later route entry was started.
+    pub cancelled: bool,
 }
 
 /// Source of monotonic time used by pre-commit routing deadlines. Keeping this
@@ -423,7 +443,9 @@ impl Application {
 
     /// Try every configured entry once, in route order, until protocol success.
     /// All [`TargetError`] kinds deliberately share the exact same advance
-    /// behavior. A downstream cancellation stops this loop immediately.
+    /// behavior. Each advance is a distinct provider operation and may be
+    /// billable; v0.1 deliberately has no cross-provider deduplication. A
+    /// downstream cancellation stops this loop immediately.
     pub fn dispatch_route(
         &self,
         route: &crate::config::RuntimeRoute,
@@ -435,14 +457,17 @@ impl Application {
         ));
         let mut attempts = Vec::with_capacity(route.targets.len());
         for (route_index, target) in route.targets.iter().cloned().enumerate() {
+            // Check before constructing or invoking the next provider. Besides
+            // avoiding needless allocation, this prevents an adapter with
+            // eager setup from beginning work after the client is gone.
+            if cancellation.is_cancelled() {
+                return Err(route_exhausted(request, attempts, false, true));
+            }
             let now = self.clock.now();
             // Equality belongs to the route-wide deadline. Never construct a
             // provider after it has expired, avoiding a billable invocation.
             if now >= overall_deadline {
-                return Err(RouteExhausted {
-                    attempts,
-                    overall_timeout: true,
-                });
+                return Err(route_exhausted(request, attempts, true, false));
             }
             let provider_kind = target.provider;
             let target_model = target.model.clone();
@@ -453,10 +478,10 @@ impl Application {
             // operation's share of the route-wide budget.
             let attempt_start = self.clock.now();
             if attempt_start >= overall_deadline {
-                return Err(RouteExhausted {
-                    attempts,
-                    overall_timeout: true,
-                });
+                return Err(route_exhausted(request, attempts, true, false));
+            }
+            if cancellation.is_cancelled() {
+                return Err(route_exhausted(request, attempts, false, true));
             }
             let attempt_deadline = attempt_start
                 .saturating_add(Duration::from_secs(target_timeout))
@@ -475,7 +500,11 @@ impl Application {
                         target_model,
                         outcome: AttemptOutcome::Succeeded,
                     });
-                    return Ok(RouteDispatch { response, attempts });
+                    return Ok(RouteDispatch {
+                        response,
+                        diagnostics: route_diagnostics(request, &attempts),
+                        attempts,
+                    });
                 }
                 Ok(Err(error)) => attempts.push(failed_attempt(
                     route_index,
@@ -490,25 +519,22 @@ impl Application {
                     TargetError::timeout(),
                 )),
                 Err(DeadlineOutcome::OverallTimeout) => {
-                    return Err(RouteExhausted {
-                        attempts,
-                        overall_timeout: true,
-                    })
+                    return Err(route_exhausted(request, attempts, true, false))
                 }
                 // Do not start another potentially billable upstream request
                 // after the downstream client has disconnected.
                 Err(DeadlineOutcome::Cancelled) => {
-                    return Err(RouteExhausted {
-                        attempts,
-                        overall_timeout: false,
-                    })
+                    attempts.push(AttemptRecord {
+                        route_index,
+                        provider: provider_kind,
+                        target_model,
+                        outcome: AttemptOutcome::Cancelled,
+                    });
+                    return Err(route_exhausted(request, attempts, false, true));
                 }
             }
         }
-        Err(RouteExhausted {
-            attempts,
-            overall_timeout: false,
-        })
+        Err(route_exhausted(request, attempts, false, false))
     }
 
     fn models_response(&self) -> HttpResponse {
@@ -527,6 +553,42 @@ impl Application {
         }
         body.push_str("]}");
         json_response(200, body)
+    }
+}
+
+fn route_exhausted(
+    request: &crate::request::CanonicalRequest,
+    attempts: Vec<AttemptRecord>,
+    overall_timeout: bool,
+    cancelled: bool,
+) -> RouteExhausted {
+    RouteExhausted {
+        diagnostics: route_diagnostics(request, &attempts),
+        attempts,
+        overall_timeout,
+        cancelled,
+    }
+}
+
+fn route_diagnostics(
+    request: &crate::request::CanonicalRequest,
+    attempts: &[AttemptRecord],
+) -> RouteDiagnostics {
+    let selected = attempts.last();
+    let (error_kind, upstream_status) = match selected.map(|attempt| attempt.outcome) {
+        Some(AttemptOutcome::Failed {
+            kind,
+            upstream_status,
+        }) => (Some(kind), upstream_status),
+        Some(AttemptOutcome::Succeeded | AttemptOutcome::Cancelled) | None => (None, None),
+    };
+    RouteDiagnostics {
+        requested_model: request.model.clone(),
+        selected_provider: selected.map(|attempt| attempt.provider),
+        selected_model: selected.map(|attempt| attempt.target_model.clone()),
+        attempt_count: attempts.len(),
+        error_kind,
+        upstream_status,
     }
 }
 

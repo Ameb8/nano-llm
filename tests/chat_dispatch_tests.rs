@@ -437,6 +437,13 @@ fn exhausted_dispatch_retains_only_safe_attempt_metadata() {
             upstream_status: Some(500),
         }
     );
+    assert_eq!(exhausted.diagnostics.requested_model, "public");
+    assert_eq!(exhausted.diagnostics.attempt_count, 2);
+    assert_eq!(
+        exhausted.diagnostics.error_kind,
+        Some(nano_llm::TargetErrorKind::UpstreamHttp)
+    );
+    assert_eq!(exhausted.diagnostics.upstream_status, Some(500));
 }
 
 #[test]
@@ -494,16 +501,21 @@ fn downstream_cancellation_drops_active_provider_work() {
     struct PendingProvider {
         cancellation: nano_llm::DownstreamCancellation,
         dropped: Arc<AtomicBool>,
+        pending: bool,
     }
     impl Provider for PendingProvider {
         fn complete<'a>(
             &'a self,
             _request: &'a CanonicalRequest,
         ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
-            Box::pin(PendingUntilDropped {
-                cancellation: self.cancellation.clone(),
-                dropped: self.dropped.clone(),
-            })
+            if self.pending {
+                Box::pin(PendingUntilDropped {
+                    cancellation: self.cancellation.clone(),
+                    dropped: self.dropped.clone(),
+                })
+            } else {
+                Box::pin(async { Ok(successful_response(FinishReason::Stop)) })
+            }
         }
 
         fn complete_stream<'a>(
@@ -518,21 +530,27 @@ fn downstream_cancellation_drops_active_provider_work() {
     let dropped = Arc::new(AtomicBool::new(false));
     let cancellation_for_factory = cancellation.clone();
     let dropped_for_factory = dropped.clone();
+    let started = Arc::new(AtomicUsize::new(0));
     let config = RuntimeConfig {
         general_settings: RuntimeGeneralSettings::default(),
         routes: vec![RuntimeRoute {
             model_name: "public".into(),
-            targets: vec![target("first")],
+            targets: vec![target("first"), target("must-not-start")],
         }],
     };
     let application = app_with_provider_factory(
         config,
         true,
-        Arc::new(move |_| {
-            Box::new(PendingProvider {
-                cancellation: cancellation_for_factory.clone(),
-                dropped: dropped_for_factory.clone(),
-            })
+        Arc::new({
+            let started = started.clone();
+            move |_| {
+                let pending = started.fetch_add(1, Ordering::AcqRel) == 0;
+                Box::new(PendingProvider {
+                    cancellation: cancellation_for_factory.clone(),
+                    dropped: dropped_for_factory.clone(),
+                    pending,
+                })
+            }
         }),
     );
 
@@ -542,6 +560,78 @@ fn downstream_cancellation_drops_active_provider_work() {
     );
     assert_eq!(response.status, 502);
     assert!(dropped.load(Ordering::Acquire));
+    assert_eq!(
+        started.load(Ordering::Acquire),
+        1,
+        "fallback must not begin"
+    );
+    // The cancelled request's permit was released, so a new request can use
+    // the sole capacity slot and complete.
+    assert_eq!(
+        application
+            .handle(&chat(
+                br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .status,
+        200
+    );
+}
+
+#[test]
+fn route_diagnostics_are_complete_and_cannot_contain_upstream_canaries() {
+    let secret = "upstream-body-and-credential-canary";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let dispatch_app = sequenced_application(
+        vec![
+            SequencedOutcome::Failure(TargetError::from_upstream_status(503)),
+            SequencedOutcome::Success(successful_response(FinishReason::Stop)),
+        ],
+        seen,
+    );
+    let route = RuntimeRoute {
+        model_name: "public".into(),
+        targets: vec![
+            RuntimeTarget {
+                api_key: Some(nano_llm::SecretString::new(secret.into())),
+                ..target("first")
+            },
+            target("second"),
+        ],
+    };
+    let canonical = nano_llm::decode_chat_request(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    )
+    .unwrap();
+
+    let dispatch = dispatch_app
+        .dispatch_route(
+            &route,
+            &canonical,
+            &nano_llm::DownstreamCancellation::default(),
+        )
+        .unwrap();
+    let diagnostics = dispatch.diagnostics;
+    assert_eq!(diagnostics.requested_model, "public");
+    assert_eq!(
+        diagnostics.selected_provider,
+        Some(nano_llm::ProviderKind::OpenAi)
+    );
+    assert_eq!(diagnostics.selected_model.as_deref(), Some("openai/second"));
+    assert_eq!(diagnostics.attempt_count, 2);
+    assert_eq!(diagnostics.error_kind, None);
+    assert_eq!(diagnostics.upstream_status, None);
+    assert!(!format!("{diagnostics:?}").contains(secret));
+
+    let response = application(
+        vec![target("only")],
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+        true,
+    )
+    .handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"upstream-body-and-credential-canary"}]}"#,
+    ));
+    assert!(!String::from_utf8(response.body).unwrap().contains(secret));
 }
 
 #[derive(Default)]

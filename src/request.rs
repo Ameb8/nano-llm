@@ -3,12 +3,23 @@
 //! This deliberately does not use a map-backed JSON representation: maps erase
 //! duplicate members before validation can report them.
 
+use crate::config::{ProviderKind, RuntimeRoute};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalRequest {
     /// The validated request. Object members retain their input order.
     pub fields: Vec<(String, JsonValue)>,
+    /// Gateway-owned, provider-neutral normalized values.
+    pub model: String,
+    pub stream: bool,
+    pub include_usage: bool,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub stop: Option<Vec<String>>,
+    /// Leading `system` and `developer` content, joined with exactly `\n\n`.
+    pub instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +94,143 @@ pub fn decode_chat_request(bytes: &[u8]) -> Result<CanonicalRequest, DecodeError
         });
     };
     validate_top(&fields)?;
-    Ok(CanonicalRequest { fields })
+    canonicalize(fields)
+}
+
+/// Decode and validate a request against the selected immutable fallback route.
+///
+/// This is deliberately separate from JSON decoding because only the selected
+/// route can establish whether an output-token limit is required.
+pub fn decode_chat_request_for_route(
+    bytes: &[u8],
+    route: &RuntimeRoute,
+) -> Result<CanonicalRequest, DecodeError> {
+    let request = decode_chat_request(bytes)?;
+    request.validate_for_route(route)?;
+    Ok(request)
+}
+
+impl CanonicalRequest {
+    /// Validate route-wide representability requirements before routing begins.
+    pub fn validate_for_route(&self, route: &RuntimeRoute) -> Result<(), DecodeError> {
+        if route
+            .targets
+            .iter()
+            .any(|target| target.provider == ProviderKind::Anthropic)
+            && self.max_tokens.is_none()
+        {
+            return Err(validation(
+                Some("max_tokens"),
+                "'max_tokens' or 'max_completion_tokens' is required for routes containing Anthropic targets",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn canonicalize(fields: Vec<(String, JsonValue)>) -> Result<CanonicalRequest, DecodeError> {
+    let model = match field(&fields, "model").unwrap() {
+        JsonValue::String(value) => value.clone(),
+        _ => unreachable!("validate_top validates model"),
+    };
+    let stream = matches!(field(&fields, "stream"), Some(JsonValue::Bool(true)));
+    let include_usage = match field(&fields, "stream_options") {
+        Some(JsonValue::Object(options)) => {
+            matches!(field(options, "include_usage"), Some(JsonValue::Bool(true)))
+        }
+        None => false,
+        _ => unreachable!("validate_top validates stream_options"),
+    };
+    let max_tokens = match (
+        field(&fields, "max_tokens"),
+        field(&fields, "max_completion_tokens"),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(validation(
+                Some("max_tokens"),
+                "'max_tokens' and 'max_completion_tokens' cannot both be supplied",
+            ))
+        }
+        (Some(value), None) | (None, Some(value)) => Some(positive_i32(value, "max_tokens")?),
+        (None, None) => None,
+    };
+    let temperature = optional_probability(field(&fields, "temperature"), "temperature")?;
+    let top_p = optional_probability(field(&fields, "top_p"), "top_p")?;
+    let stop = match field(&fields, "stop") {
+        Some(JsonValue::String(value)) => Some(vec![value.clone()]),
+        Some(JsonValue::Array(values)) => Some(
+            values
+                .iter()
+                .map(|value| match value {
+                    JsonValue::String(value) => value.clone(),
+                    _ => unreachable!("validate_top validates stop"),
+                })
+                .collect(),
+        ),
+        None => None,
+        _ => unreachable!("validate_top validates stop"),
+    };
+    let instruction = combined_instruction(field(&fields, "messages").unwrap());
+    Ok(CanonicalRequest {
+        fields,
+        model,
+        stream,
+        include_usage,
+        max_tokens,
+        temperature,
+        top_p,
+        stop,
+        instruction,
+    })
+}
+
+fn positive_i32(value: &JsonValue, param: &str) -> Result<u32, DecodeError> {
+    let JsonValue::Number(text) = value else {
+        unreachable!("caller validates number")
+    };
+    if text.contains(['.', 'e', 'E']) {
+        return Err(validation(
+            Some(param),
+            format!("'{param}' must be an integer from 1 through 2147483647"),
+        ));
+    }
+    match text.parse::<u32>() {
+        Ok(value @ 1..=2_147_483_647) => Ok(value),
+        _ => Err(validation(
+            Some(param),
+            format!("'{param}' must be an integer from 1 through 2147483647"),
+        )),
+    }
+}
+
+fn optional_probability(
+    value: Option<&JsonValue>,
+    param: &str,
+) -> Result<Option<f64>, DecodeError> {
+    let Some(JsonValue::Number(text)) = value else {
+        return Ok(None);
+    };
+    match text.parse::<f64>() {
+        Ok(value) if (0.0..=1.0).contains(&value) => Ok(Some(value)),
+        _ => Err(validation(
+            Some(param),
+            format!("'{param}' must be a number from 0 through 1"),
+        )),
+    }
+}
+
+fn combined_instruction(messages: &JsonValue) -> Option<String> {
+    let JsonValue::Array(messages) = messages else {
+        unreachable!("validate_top validates messages")
+    };
+    let parts: Vec<&str> = messages.iter().take_while(|message| match message {
+        JsonValue::Object(fields) => matches!(field(fields, "role"), Some(JsonValue::String(role)) if role == "system" || role == "developer"),
+        _ => false,
+    }).map(|message| match message {
+        JsonValue::Object(fields) => match field(fields, "content") { Some(JsonValue::String(content)) => content.as_str(), _ => unreachable!("message validation requires instruction content") },
+        _ => unreachable!(),
+    }).collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn validation(param: Option<&str>, message: impl Into<String>) -> DecodeError {
@@ -215,10 +362,20 @@ fn validate_top(fields: &[(String, JsonValue)]) -> Result<(), DecodeError> {
     }
     string(field(fields, "model").unwrap(), "model", "model")?;
     validate_messages(field(fields, "messages").unwrap())?;
-    if let Some(value) = field(fields, "stream") {
-        boolean(value, "stream", "stream")?;
-    }
+    let stream = match field(fields, "stream") {
+        Some(value) => {
+            boolean(value, "stream", "stream")?;
+            matches!(value, JsonValue::Bool(true))
+        }
+        None => false,
+    };
     if let Some(value) = field(fields, "stream_options") {
+        if !stream {
+            return Err(validation(
+                Some("stream_options"),
+                "'stream_options' is allowed only when 'stream' is true",
+            ));
+        }
         validate_stream_options(value)?;
     }
     if let Some(value) = field(fields, "tools") {
@@ -237,6 +394,12 @@ fn validate_top(fields: &[(String, JsonValue)]) -> Result<(), DecodeError> {
             number(value, key, key)?;
         }
     }
+    if field(fields, "max_tokens").is_some() && field(fields, "max_completion_tokens").is_some() {
+        return Err(validation(
+            Some("max_tokens"),
+            "'max_tokens' and 'max_completion_tokens' cannot both be supplied",
+        ));
+    }
     if let Some(value) = field(fields, "stop") {
         validate_stop(value)?;
     }
@@ -245,10 +408,20 @@ fn validate_top(fields: &[(String, JsonValue)]) -> Result<(), DecodeError> {
 
 fn validate_stop(value: &JsonValue) -> Result<(), DecodeError> {
     match value {
-        JsonValue::String(_) => Ok(()),
+        JsonValue::String(value) => validate_stop_string(value, "stop"),
         JsonValue::Array(values) => {
+            if values.len() > 4 {
+                return Err(validation(
+                    Some("stop"),
+                    "'stop' may contain at most four strings",
+                ));
+            }
             for (index, value) in values.iter().enumerate() {
                 string(value, "stop", &path_index("stop", index))?;
+                let JsonValue::String(value) = value else {
+                    unreachable!()
+                };
+                validate_stop_string(value, &path_index("stop", index))?;
             }
             Ok(())
         }
@@ -259,8 +432,25 @@ fn validate_stop(value: &JsonValue) -> Result<(), DecodeError> {
     }
 }
 
+fn validate_stop_string(value: &str, path: &str) -> Result<(), DecodeError> {
+    if value.is_empty() || value.len() > 256 {
+        return Err(validation(
+            Some("stop"),
+            format!("'{path}' must be a nonempty string no larger than 256 UTF-8 bytes"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
     let messages = array(value, "messages", "messages")?;
+    if messages.is_empty() {
+        return Err(validation(
+            Some("messages"),
+            "'messages' must be a nonempty array",
+        ));
+    }
+    let mut state = TurnState::Instruction;
     for (index, value) in messages.iter().enumerate() {
         let path = path_index("messages", index);
         let fields = object(value, "messages", &path)?;
@@ -277,7 +467,7 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
             ));
         };
         match role.as_str() {
-            "system" | "developer" | "user" => {
+            "system" | "developer" => {
                 closed(
                     fields,
                     &["role", "content"],
@@ -290,6 +480,33 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
                     "messages",
                     &path_member(&path, "content"),
                 )?;
+                if state != TurnState::Instruction {
+                    return Err(validation(
+                        Some("messages"),
+                        format!("'{path}.role' instructions must precede conversation turns"),
+                    ));
+                }
+            }
+            "user" => {
+                closed(
+                    fields,
+                    &["role", "content"],
+                    &["role", "content"],
+                    "messages",
+                    &path,
+                )?;
+                string(
+                    field(fields, "content").unwrap(),
+                    "messages",
+                    &path_member(&path, "content"),
+                )?;
+                if !matches!(state, TurnState::Instruction | TurnState::AfterAssistant) {
+                    return Err(validation(
+                        Some("messages"),
+                        format!("unexpected user message at '{path}'"),
+                    ));
+                }
+                state = TurnState::AfterUser;
             }
             "assistant" => {
                 closed(
@@ -310,6 +527,25 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
                 if let Some(calls) = field(fields, "tool_calls") {
                     validate_tool_calls(calls, &path)?;
                 }
+                let has_content = matches!(field(fields, "content"), Some(JsonValue::String(_)));
+                let has_calls = field(fields, "tool_calls").is_some();
+                if !has_content && !has_calls {
+                    return Err(validation(
+                        Some("messages"),
+                        format!("'{path}' must contain string content and/or nonempty tool_calls"),
+                    ));
+                }
+                if state != TurnState::AfterUser {
+                    return Err(validation(
+                        Some("messages"),
+                        format!("unexpected assistant message at '{path}'"),
+                    ));
+                }
+                state = if has_calls {
+                    TurnState::ToolResults
+                } else {
+                    TurnState::AfterAssistant
+                };
             }
             "tool" => {
                 closed(
@@ -324,6 +560,13 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
                     "messages",
                     &path_member(&path, "tool_call_id"),
                 )?;
+                if !matches!(state, TurnState::ToolResults | TurnState::AfterToolResult) {
+                    return Err(validation(
+                        Some("messages"),
+                        format!("unexpected tool result at '{path}'"),
+                    ));
+                }
+                state = TurnState::AfterToolResult;
                 string(
                     field(fields, "content").unwrap(),
                     "messages",
@@ -338,11 +581,32 @@ fn validate_messages(value: &JsonValue) -> Result<(), DecodeError> {
             }
         }
     }
+    if !matches!(state, TurnState::AfterUser | TurnState::AfterToolResult) {
+        return Err(validation(
+            Some("messages"),
+            "'messages' must end on a user-side turn",
+        ));
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnState {
+    Instruction,
+    AfterUser,
+    AfterAssistant,
+    ToolResults,
+    AfterToolResult,
 }
 
 fn validate_tool_calls(value: &JsonValue, parent: &str) -> Result<(), DecodeError> {
     let calls = array(value, "messages", &path_member(parent, "tool_calls"))?;
+    if calls.is_empty() {
+        return Err(validation(
+            Some("messages"),
+            format!("'{parent}.tool_calls' must be nonempty"),
+        ));
+    }
     for (index, value) in calls.iter().enumerate() {
         let path = path_index(&path_member(parent, "tool_calls"), index);
         let fields = object(value, "messages", &path)?;

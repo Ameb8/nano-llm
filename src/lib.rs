@@ -8,7 +8,9 @@ pub use config::{
     EnvLookupError, EnvProvider, ProviderKind, RawConfig, RuntimeConfig, RuntimeGeneralSettings,
     RuntimeRoute, RuntimeTarget, SecretString, SystemEnv,
 };
-pub use request::{decode_chat_request, CanonicalRequest, DecodeError, JsonValue};
+pub use request::{
+    decode_chat_request, decode_chat_request_for_route, CanonicalRequest, DecodeError, JsonValue,
+};
 
 /// Returns the package version string.
 pub fn version() -> &'static str {

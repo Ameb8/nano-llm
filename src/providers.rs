@@ -202,6 +202,17 @@ pub struct OutboundResponse {
     pub body: Vec<u8>,
 }
 
+/// A response body delivered as transport-sized byte fragments.  Fragments do
+/// not have any SSE framing meaning and may split anywhere.
+pub type OutboundByteStream = Box<dyn Iterator<Item = Result<Vec<u8>, TransportError>> + Send>;
+
+/// Successful streaming HTTP response.  Unlike [`OutboundResponse`], its body
+/// is deliberately not retained by the transport.
+pub struct OutboundStreamResponse {
+    pub status: u16,
+    pub body: OutboundByteStream,
+}
+
 impl fmt::Debug for OutboundResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -235,6 +246,19 @@ pub trait OutboundTransport: Send + Sync {
         policy: SecureTransportPolicy,
         request: OutboundRequest,
     ) -> Result<OutboundResponse, TransportError>;
+
+    /// Start a response whose body is consumed incrementally.  The default
+    /// keeps existing buffered-only transports explicit: they cannot be used
+    /// to accidentally buffer a native SSE response.
+    fn execute_stream(
+        &self,
+        _policy: SecureTransportPolicy,
+        _request: OutboundRequest,
+    ) -> Result<OutboundStreamResponse, TransportError> {
+        Err(TransportError {
+            kind: TransportErrorKind::Connection,
+        })
+    }
 }
 
 /// A target-bound provider construction. The target is copied only after

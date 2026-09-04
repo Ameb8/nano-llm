@@ -12,12 +12,14 @@ pub use config::{
     EnvLookupError, EnvProvider, ProviderKind, RawConfig, RuntimeConfig, RuntimeGeneralSettings,
     RuntimeRoute, RuntimeTarget, SecretString, SystemEnv,
 };
-pub use openai_compatible::{OpenAiCompatibleProvider, MAX_BUFFERED_RESPONSE_BYTES};
+pub use openai_compatible::{
+    OpenAiCompatibleProvider, OpenAiSseDecoder, MAX_BUFFERED_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES,
+};
 pub use providers::{
-    build_provider, build_provider_with_transport, OutboundRequest, OutboundResponse,
-    OutboundTransport, Provider, ProviderFuture, ProviderStream, SecureTransportPolicy,
-    TargetError, TargetErrorKind, TargetProvider, TransportError, TransportErrorKind,
-    TransportTlsVerification,
+    build_provider, build_provider_with_transport, OutboundByteStream, OutboundRequest,
+    OutboundResponse, OutboundStreamResponse, OutboundTransport, Provider, ProviderFuture,
+    ProviderStream, SecureTransportPolicy, TargetError, TargetErrorKind, TargetProvider,
+    TransportError, TransportErrorKind, TransportTlsVerification,
 };
 pub use request::{
     decode_chat_request, decode_chat_request_fields, decode_chat_request_for_route,

@@ -12,13 +12,17 @@ use crate::providers::{
 };
 use crate::request::{CanonicalRequest, JsonValue};
 use crate::response::{
-    normalize_response, normalize_usage, NativeChoice, NativeResponse, NativeTerminal,
-    NativeToolCall, ResponseError, ResponseMetadata,
+    normalize_response, normalize_usage, AssistantDelta, ChatChunk, NativeChoice, NativeResponse,
+    NativeTerminal, NativeToolCall, ResponseError, ResponseMetadata, StreamAssembler,
+    ToolCallDelta, Usage,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Fixed maximum body retained for a buffered provider completion.
 pub const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum decoded payload of one native SSE event.
+pub const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
 /// One target of the OpenAI-compatible provider family.
 pub struct OpenAiCompatibleProvider {
@@ -54,7 +58,7 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    fn outbound_request(&self, request: &CanonicalRequest) -> OutboundRequest {
+    fn outbound_request(&self, request: &CanonicalRequest, stream: bool) -> OutboundRequest {
         let mut fields = request.fields.clone();
         replace_field(
             &mut fields,
@@ -62,6 +66,9 @@ impl OpenAiCompatibleProvider {
             JsonValue::String(self.target.model_suffix.clone()),
         );
         replace_field(&mut fields, "messages", compatible_messages(request));
+        if stream {
+            replace_field(&mut fields, "stream", JsonValue::Bool(true));
+        }
 
         let mut headers = vec![("Content-Type".into(), "application/json".into())];
         if let Some(key) = &self.target.api_key {
@@ -87,7 +94,7 @@ impl Provider for OpenAiCompatibleProvider {
         Box::pin(async move {
             let response = self
                 .transport
-                .execute(self.transport_policy, self.outbound_request(request))
+                .execute(self.transport_policy, self.outbound_request(request, false))
                 .map_err(|error| match error.kind {
                     TransportErrorKind::Timeout => TargetError::timeout(),
                     TransportErrorKind::Connection => TargetError::connection(),
@@ -106,11 +113,192 @@ impl Provider for OpenAiCompatibleProvider {
 
     fn complete_stream<'a>(
         &'a self,
-        _request: &'a CanonicalRequest,
+        request: &'a CanonicalRequest,
     ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
-        // Streaming parsing is deliberately a separate delivery slice.  Do
-        // not accidentally send a buffered request with stream semantics.
-        Box::pin(async { Err(TargetError::invalid_response()) })
+        Box::pin(async move {
+            let response = self
+                .transport
+                .execute_stream(self.transport_policy, self.outbound_request(request, true))
+                .map_err(|error| match error.kind {
+                    TransportErrorKind::Timeout => TargetError::timeout(),
+                    TransportErrorKind::Connection => TargetError::connection(),
+                })?;
+            if !(200..300).contains(&response.status) {
+                return Err(TargetError::from_upstream_status(response.status));
+            }
+            Ok(Box::new(OpenAiSseDecoder::new(
+                request.clone(),
+                ResponseMetadata::for_model(&request.model),
+                self.target.provider,
+                response.body,
+            )) as ProviderStream)
+        })
+    }
+}
+
+/// Incremental OpenAI-family SSE decoder. It retains at most one decoded SSE
+/// event and delegates all canonical stream state to `StreamAssembler`.
+pub struct OpenAiSseDecoder {
+    provider: ProviderKind,
+    source: crate::providers::OutboundByteStream,
+    assembler: StreamAssembler,
+    input: Vec<u8>,
+    data: Vec<u8>,
+    pending: VecDeque<Result<ChatChunk, TargetError>>,
+    done: bool,
+    exhausted: bool,
+    usage: Option<Usage>,
+}
+
+impl OpenAiSseDecoder {
+    pub fn new(
+        request: CanonicalRequest,
+        metadata: ResponseMetadata,
+        provider: ProviderKind,
+        source: crate::providers::OutboundByteStream,
+    ) -> Self {
+        Self {
+            provider,
+            source,
+            assembler: StreamAssembler::new(&request, metadata),
+            input: Vec::new(),
+            data: Vec::new(),
+            pending: VecDeque::new(),
+            done: false,
+            exhausted: false,
+            usage: None,
+        }
+    }
+
+    fn invalid() -> TargetError {
+        TargetError::invalid_response()
+    }
+
+    fn consume_line(&mut self, mut line: Vec<u8>) -> Result<(), TargetError> {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            return self.dispatch();
+        }
+        if line[0] == b':' {
+            return Ok(());
+        }
+        if let Some(value) = line.strip_prefix(b"data:") {
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            let extra = value.len() + usize::from(!self.data.is_empty());
+            if self.data.len().saturating_add(extra) > MAX_SSE_EVENT_BYTES {
+                return Err(Self::invalid());
+            }
+            if !self.data.is_empty() {
+                self.data.push(b'\n');
+            }
+            self.data.extend_from_slice(value);
+        }
+        // `event`, `id`, and `retry` are SSE transport metadata. They do not
+        // affect the OpenAI data payload.
+        Ok(())
+    }
+
+    fn dispatch(&mut self) -> Result<(), TargetError> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        let payload = std::mem::take(&mut self.data);
+        if self.done {
+            return Err(Self::invalid());
+        }
+        if payload == b"[DONE]" {
+            self.assembler.finish().map_err(response_error)?;
+            self.done = true;
+            if let Some(usage) = self.usage.take() {
+                if let Some(chunk) = self.assembler.usage_chunk(usage).map_err(response_error)? {
+                    self.pending.push_back(Ok(chunk));
+                }
+            }
+            return Ok(());
+        }
+        let value = crate::request::decode_json_object(&payload).map_err(|_| Self::invalid())?;
+        let choices = array(required(&value, "choices")?)?;
+        if choices.is_empty() {
+            // Empty choices are metadata only for the explicit compatible
+            // usage event; all other zero-choice events are invalid.
+            let Some(usage) = get(&value, "usage") else {
+                return Err(Self::invalid());
+            };
+            self.usage = parse_usage(usage);
+            return Ok(());
+        }
+        if choices.len() != 1 {
+            return Err(Self::invalid());
+        }
+        let (index, delta, terminal) = parse_stream_choice(&choices[0], self.provider)?;
+        if let Some(chunk) = self
+            .assembler
+            .push(index, delta, terminal)
+            .map_err(response_error)?
+        {
+            self.pending.push_back(Ok(chunk));
+        }
+        Ok(())
+    }
+
+    fn next_event(&mut self) -> Result<bool, TargetError> {
+        loop {
+            if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<_> = self.input.drain(..=newline).collect();
+                self.consume_line(line[..line.len() - 1].to_vec())?;
+                return Ok(true);
+            }
+            match self.source.next() {
+                Some(Ok(bytes)) => {
+                    // Framing fields are not part of the decoded `data`
+                    // payload limit. Keep a small bounded allowance so a
+                    // max-size data line can arrive before its delimiter.
+                    if self.input.len().saturating_add(bytes.len())
+                        > MAX_SSE_EVENT_BYTES + 64 * 1024
+                    {
+                        return Err(Self::invalid());
+                    }
+                    self.input.extend_from_slice(&bytes);
+                }
+                Some(Err(_)) => return Err(TargetError::connection()),
+                None => {
+                    self.exhausted = true;
+                    if !self.input.is_empty() || !self.data.is_empty() || !self.done {
+                        return Err(Self::invalid());
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for OpenAiSseDecoder {
+    type Item = Result<ChatChunk, TargetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.pending.pop_front() {
+            return Some(item);
+        }
+        if self.exhausted {
+            return None;
+        }
+        loop {
+            match self.next_event() {
+                Ok(false) => return self.pending.pop_front(),
+                Ok(true) => {
+                    if let Some(item) = self.pending.pop_front() {
+                        return Some(item);
+                    }
+                }
+                Err(error) => {
+                    self.exhausted = true;
+                    return Some(Err(error));
+                }
+            }
+        }
     }
 }
 
@@ -175,6 +363,92 @@ fn parse_choice(value: &JsonValue, provider: ProviderKind) -> Result<NativeChoic
         content,
         calls,
         terminal,
+    })
+}
+
+fn parse_stream_choice(
+    value: &JsonValue,
+    provider: ProviderKind,
+) -> Result<(u64, AssistantDelta, Option<NativeTerminal>), TargetError> {
+    let choice = object(value)?;
+    let index = unsigned(required(choice, "index")?)?;
+    let delta = object(required(choice, "delta")?)?;
+    let role = match get(delta, "role") {
+        None => None,
+        Some(JsonValue::String(role)) if role == "assistant" => Some("assistant"),
+        Some(_) => return Err(TargetError::invalid_response()),
+    };
+    let content = match get(delta, "content") {
+        None | Some(JsonValue::Null) => None,
+        Some(JsonValue::String(content)) => Some(content.clone()),
+        Some(_) => return Err(TargetError::invalid_response()),
+    };
+    let tool_calls = match get(delta, "tool_calls") {
+        None => Vec::new(),
+        Some(value) => {
+            let calls = array(value)?;
+            if calls.is_empty() {
+                return Err(TargetError::invalid_response());
+            }
+            calls
+                .iter()
+                .map(parse_stream_tool_call)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    let terminal = match required(choice, "finish_reason")? {
+        JsonValue::Null => None,
+        JsonValue::String(reason) => Some(terminal(reason, provider)),
+        _ => return Err(TargetError::invalid_response()),
+    };
+    Ok((
+        index,
+        AssistantDelta {
+            role,
+            content,
+            tool_calls,
+        },
+        terminal,
+    ))
+}
+
+fn parse_stream_tool_call(value: &JsonValue) -> Result<ToolCallDelta, TargetError> {
+    let call = object(value)?;
+    let index = usize::try_from(unsigned(required(call, "index")?)?)
+        .map_err(|_| TargetError::invalid_response())?;
+    let id = match get(call, "id") {
+        None => None,
+        Some(JsonValue::String(id)) => Some(id.clone()),
+        Some(_) => return Err(TargetError::invalid_response()),
+    };
+    let r#type = match get(call, "type") {
+        None => None,
+        Some(JsonValue::String(kind)) if kind == "function" => Some("function"),
+        Some(_) => return Err(TargetError::invalid_response()),
+    };
+    let (name, arguments) = match get(call, "function") {
+        None => (None, None),
+        Some(value) => {
+            let function = object(value)?;
+            let name = match get(function, "name") {
+                None => None,
+                Some(JsonValue::String(name)) => Some(name.clone()),
+                Some(_) => return Err(TargetError::invalid_response()),
+            };
+            let arguments = match get(function, "arguments") {
+                None => None,
+                Some(JsonValue::String(arguments)) => Some(arguments.clone()),
+                Some(_) => return Err(TargetError::invalid_response()),
+            };
+            (name, arguments)
+        }
+    };
+    Ok(ToolCallDelta {
+        index,
+        id,
+        r#type,
+        name,
+        arguments,
     })
 }
 
@@ -366,10 +640,98 @@ mod tests {
     use crate::config::SecretString;
     use crate::providers::{OutboundResponse, TransportError};
     use crate::request::decode_chat_request;
+    use crate::response::FinishReason;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn stream_request(extra: &str) -> CanonicalRequest {
+        decode_chat_request(
+            format!(
+                r#"{{"model":"alias","messages":[{{"role":"user","content":"hi"}}],"stream":true{extra}}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn decode_sse(
+        request: CanonicalRequest,
+        pieces: &[&str],
+    ) -> Vec<Result<ChatChunk, TargetError>> {
+        let source = Box::new(
+            pieces
+                .iter()
+                .map(|piece| Ok(piece.as_bytes().to_vec()))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        );
+        OpenAiSseDecoder::new(
+            request.clone(),
+            ResponseMetadata::for_model(&request.model),
+            ProviderKind::OpenAi,
+            source,
+        )
+        .collect()
+    }
+
+    #[test]
+    fn sse_decodes_split_events_synthesizes_role_and_retains_usage() {
+        let request = stream_request(",\"stream_options\":{\"include_usage\":true}");
+        let events = [
+            ": keepalive\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel",
+            "lo\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let chunks = decode_sse(request, &events);
+        assert_eq!(chunks.len(), 3);
+        let first = chunks[0].as_ref().unwrap();
+        assert_eq!(first.choices[0].delta.role, Some("assistant"));
+        assert_eq!(first.choices[0].delta.content.as_deref(), Some("hello"));
+        assert_eq!(
+            chunks[1].as_ref().unwrap().choices[0].finish_reason,
+            Some(FinishReason::Stop)
+        );
+        let usage = chunks[2].as_ref().unwrap();
+        assert!(usage.choices.is_empty());
+        assert_eq!(usage.usage.as_ref().unwrap().total_tokens, 5);
+    }
+
+    #[test]
+    fn sse_rejects_zero_choice_non_usage_and_terminal_ordering() {
+        for events in [
+            vec!["data: {\"choices\":[]}\n\n"],
+            vec!["data: [DONE]\n\n"],
+            vec!["data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"],
+        ] {
+            let output = decode_sse(stream_request(""), &events);
+            assert!(output.iter().any(|item| item.is_err()));
+        }
+    }
+
+    #[test]
+    fn sse_assembles_tools_and_rejects_oversized_events() {
+        let request = stream_request(
+            ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"weather\"}}]",
+        );
+        let output = decode_sse(request, &[
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"wea\",\"arguments\":\"{\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"ther\",\"arguments\":\"}\"}}]},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ]);
+        assert!(output.iter().all(Result::is_ok));
+        assert_eq!(
+            output[1].as_ref().unwrap().choices[0].finish_reason,
+            Some(FinishReason::ToolCalls)
+        );
+
+        let large = "x".repeat(MAX_SSE_EVENT_BYTES + 1);
+        let output = decode_sse(stream_request(""), &[&format!("data: {large}\n\n")]);
+        assert!(output.iter().any(|item| item.is_err()));
+    }
 
     struct CaptureTransport {
         requests: Mutex<Vec<OutboundRequest>>,

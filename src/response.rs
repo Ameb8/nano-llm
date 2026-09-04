@@ -438,8 +438,8 @@ struct PartialCall {
 
 /// Stateful conformance boundary for one native stream.  `push` returns only
 /// ordinary chunks; `usage_chunk` returns the one permitted zero-choice chunk.
-pub struct StreamAssembler<'a> {
-    request: &'a CanonicalRequest,
+pub struct StreamAssembler {
+    request: CanonicalRequest,
     metadata: ResponseMetadata,
     calls: HashMap<usize, PartialCall>,
     used_ids: HashSet<String>,
@@ -450,10 +450,10 @@ pub struct StreamAssembler<'a> {
     emitted_usage: bool,
 }
 
-impl<'a> StreamAssembler<'a> {
-    pub fn new(request: &'a CanonicalRequest, metadata: ResponseMetadata) -> Self {
+impl StreamAssembler {
+    pub fn new(request: &CanonicalRequest, metadata: ResponseMetadata) -> Self {
         Self {
-            request,
+            request: request.clone(),
             metadata,
             calls: HashMap::new(),
             used_ids: HashSet::new(),
@@ -507,7 +507,7 @@ impl<'a> StreamAssembler<'a> {
             let calls = self.completed_calls()?;
             let content = self.saw_content.then_some("");
             let finish = normalize_terminal(native, content, !calls.is_empty())?;
-            validate_outcome(self.request, content, &calls, finish)?;
+            validate_outcome(&self.request, content, &calls, finish)?;
             self.terminal = true;
             Some(finish)
         } else {
@@ -614,7 +614,7 @@ impl<'a> StreamAssembler<'a> {
     }
 
     fn completed_calls(&self) -> Result<Vec<ToolCall>, ResponseError> {
-        let declared = declared_tools(self.request);
+        let declared = declared_tools(&self.request);
         let mut calls: Vec<_> = self.calls.iter().collect();
         calls.sort_by_key(|(index, _)| **index);
         calls

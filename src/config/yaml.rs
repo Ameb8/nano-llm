@@ -84,12 +84,7 @@ fn is_plain_non_string(s: &str) -> Option<&'static str> {
     {
         return Some("integer");
     }
-    // Decimal integers
-    let digits = s
-        .strip_prefix('+')
-        .or_else(|| s.strip_prefix('-'))
-        .unwrap_or(s);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+    if is_yaml_decimal_integer(s) {
         return Some("integer");
     }
     // Float constants (.nan, .inf)
@@ -104,10 +99,30 @@ fn is_plain_non_string(s: &str) -> Option<&'static str> {
         return Some("float");
     }
     // Numbers with decimal point or scientific notation
-    if (s.contains('.') || s.contains('e') || s.contains('E')) && s.parse::<f64>().is_ok() {
+    if (s.contains('.') || s.contains('e') || s.contains('E'))
+        && s.replace('_', "").parse::<f64>().is_ok()
+    {
         return Some("float");
     }
     None
+}
+
+/// Returns whether a scalar uses the accepted decimal YAML-integer spelling.
+///
+/// YAML permits `_` as a digit separator. Keeping this check separate from
+/// Rust's number parser avoids accidentally treating an integral-looking float
+/// (for example `30.0` or `3e1`) as an integer during deserialization.
+fn is_yaml_decimal_integer(s: &str) -> bool {
+    let digits = s
+        .strip_prefix('+')
+        .or_else(|| s.strip_prefix('-'))
+        .unwrap_or(s);
+    !digits.is_empty()
+        && !digits.starts_with('_')
+        && !digits.ends_with('_')
+        && digits
+            .split('_')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
 struct YamlStream<'a> {
@@ -773,14 +788,25 @@ fn parse_optional_number(node: &SpannedNode, path: &str) -> Result<Option<f64>, 
                 && (value == "~" || value.eq_ignore_ascii_case("null") || value.is_empty())
             {
                 Ok(None)
-            } else if let Ok(num) = value.parse::<f64>() {
+            } else if *style == ScalarStyle::Plain && is_yaml_decimal_integer(value) {
+                // `_` is legal YAML integer syntax but not Rust numeric syntax.
+                let num = value.replace('_', "").parse::<f64>().map_err(|_| {
+                    ConfigError::new(
+                        ConfigErrorKind::InvalidType {
+                            path: path.to_string(),
+                            expected: "integer",
+                            found: value.clone(),
+                        },
+                        Some(node.location()),
+                    )
+                })?;
                 if num.is_finite() {
                     Ok(Some(num))
                 } else {
                     Err(ConfigError::new(
                         ConfigErrorKind::InvalidType {
                             path: path.to_string(),
-                            expected: "finite number",
+                            expected: "integer",
                             found: value.clone(),
                         },
                         Some(node.location()),
@@ -790,7 +816,7 @@ fn parse_optional_number(node: &SpannedNode, path: &str) -> Result<Option<f64>, 
                 Err(ConfigError::new(
                     ConfigErrorKind::InvalidType {
                         path: path.to_string(),
-                        expected: "number",
+                        expected: "integer",
                         found: value.clone(),
                     },
                     Some(node.location()),
@@ -815,8 +841,20 @@ fn parse_optional_integer(node: &SpannedNode, path: &str) -> Result<Option<usize
                 && (value == "~" || value.eq_ignore_ascii_case("null") || value.is_empty())
             {
                 Ok(None)
-            } else if let Ok(num) = value.parse::<usize>() {
-                Ok(Some(num))
+            } else if *style == ScalarStyle::Plain && is_yaml_decimal_integer(value) {
+                let normalized = value.replace('_', "");
+                if let Ok(num) = normalized.parse::<usize>() {
+                    Ok(Some(num))
+                } else {
+                    Err(ConfigError::new(
+                        ConfigErrorKind::InvalidType {
+                            path: path.to_string(),
+                            expected: "integer",
+                            found: value.clone(),
+                        },
+                        Some(node.location()),
+                    ))
+                }
             } else {
                 Err(ConfigError::new(
                     ConfigErrorKind::InvalidType {

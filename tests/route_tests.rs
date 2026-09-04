@@ -174,7 +174,6 @@ fn test_invalid_timeouts_rejected() {
     let invalid_cases = [
         ("timeout: 0", "target timeout 0"),
         ("timeout: 86401", "target timeout 86401"),
-        ("timeout: 10.5", "target float timeout"),
     ];
 
     for (field_line, desc) in invalid_cases {
@@ -200,4 +199,25 @@ general_settings:
             err.kind
         );
     }
+}
+
+#[test]
+fn test_float_timeout_is_rejected_during_yaml_deserialization() {
+    let yaml = r#"
+model_list:
+  - model_name: default
+    litellm_params:
+      model: openai/gpt-4o
+      timeout: 10.5
+"#;
+
+    let err = parse_yaml_str(yaml).expect_err("float timeout must not deserialize as an integer");
+    assert!(matches!(
+        err.kind,
+        ConfigErrorKind::InvalidType {
+            path,
+            expected: "integer",
+            ..
+        } if path == "model_list[0].litellm_params.timeout"
+    ));
 }

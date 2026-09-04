@@ -37,7 +37,7 @@ model_list:
       model: mistral/mistral-small-latest
       api_key: os.environ/MISTRAL_API_KEY
       api_base: https://api.mistral.ai/v1
-      timeout: 15.5
+      timeout: 15
   - model_name: fast
     litellm_params:
       model: gemini/gemini-2.5-flash
@@ -50,7 +50,7 @@ model_list:
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   request_timeout: 30
-  overall_timeout: 120.0
+  overall_timeout: 120
   max_in_flight: 64
 "#;
     let config = parse_yaml_str(yaml).expect("should parse valid full config");
@@ -68,7 +68,7 @@ general_settings:
         config.model_list[0].litellm_params.api_base.as_deref(),
         Some("https://api.mistral.ai/v1")
     );
-    assert_eq!(config.model_list[0].litellm_params.timeout, Some(15.5));
+    assert_eq!(config.model_list[0].litellm_params.timeout, Some(15.0));
 
     assert_eq!(config.model_list[1].model_name, "fast");
     assert_eq!(
@@ -241,6 +241,20 @@ fn test_rejects_integer_mapping_key() {
   - model_name: default
     litellm_params:
       model: openai/gpt-4o
+"#;
+    let err = parse_yaml_str(yaml).unwrap_err();
+    assert_eq!(
+        err.kind,
+        ConfigErrorKind::NonStringKey {
+            found: "integer".to_string()
+        }
+    );
+}
+
+#[test]
+fn test_rejects_yaml_integer_with_digit_separator_as_mapping_key() {
+    let yaml = r#"
+1_000: model_list
 "#;
     let err = parse_yaml_str(yaml).unwrap_err();
     assert_eq!(
@@ -582,10 +596,54 @@ model_list:
         err.kind,
         ConfigErrorKind::InvalidType {
             path: "model_list[0].litellm_params.timeout".to_string(),
-            expected: "number",
+            expected: "integer",
             found: "slow".to_string(),
         }
     );
+}
+
+#[test]
+fn test_rejects_non_integer_timeout_spellings() {
+    for value in ["\"30\"", "30.0", "3e1"] {
+        let yaml = format!(
+            r#"
+model_list:
+  - model_name: default
+    litellm_params:
+      model: openai/gpt-4o
+      timeout: {value}
+"#
+        );
+        let err = parse_yaml_str(&yaml).unwrap_err();
+        assert_eq!(
+            err.kind,
+            ConfigErrorKind::InvalidType {
+                path: "model_list[0].litellm_params.timeout".to_string(),
+                expected: "integer",
+                found: value.trim_matches('"').to_string(),
+            }
+        );
+    }
+}
+
+#[test]
+fn test_rejects_quoted_and_integral_float_general_settings_integers() {
+    for (field, value) in [
+        ("request_timeout", "\"30\""),
+        ("overall_timeout", "30.0"),
+        ("max_in_flight", "\"64\""),
+    ] {
+        let yaml = format!("general_settings:\n  {field}: {value}\n");
+        let err = parse_yaml_str(&yaml).unwrap_err();
+        assert_eq!(
+            err.kind,
+            ConfigErrorKind::InvalidType {
+                path: format!("general_settings.{field}"),
+                expected: "integer",
+                found: value.trim_matches('"').to_string(),
+            }
+        );
+    }
 }
 
 #[test]

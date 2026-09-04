@@ -114,6 +114,74 @@ general_settings:
 }
 
 #[test]
+fn test_provider_presets_and_keyless_custom_target_matrix() {
+    let env = mock_env();
+    let yaml = r#"
+model_list:
+  - model_name: openai
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OAI_KEY
+  - model_name: mistral
+    litellm_params:
+      model: mistral/mistral-small
+      api_key: os.environ/MIS_KEY
+  - model_name: deepseek
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/OAI_KEY
+  - model_name: anthropic
+    litellm_params:
+      model: anthropic/claude-sonnet
+      api_key: os.environ/ANT_KEY
+  - model_name: gemini
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEM_KEY
+  - model_name: custom
+    litellm_params:
+      model: openai_compatible/llama-3
+      api_base: http://localhost:8080/v1/
+general_settings:
+  master_key: os.environ/M_KEY
+"#;
+
+    let runtime = build_runtime_config(parse_yaml_str(yaml).unwrap(), false, &env).unwrap();
+    let expected = [
+        (ProviderKind::OpenAi, "https://api.openai.com/v1", true),
+        (ProviderKind::Mistral, "https://api.mistral.ai/v1", true),
+        (ProviderKind::DeepSeek, "https://api.deepseek.com", true),
+        (
+            ProviderKind::Anthropic,
+            "https://api.anthropic.com/v1",
+            true,
+        ),
+        (
+            ProviderKind::Gemini,
+            "https://generativelanguage.googleapis.com/v1beta",
+            true,
+        ),
+        (
+            ProviderKind::OpenAiCompatible,
+            "http://localhost:8080/v1",
+            false,
+        ),
+    ];
+
+    for (route, (provider, api_base, has_key)) in runtime.routes.iter().zip(expected) {
+        let target = &route.targets[0];
+        assert_eq!(target.provider, provider, "route {}", route.model_name);
+        assert_eq!(target.api_base, api_base, "route {}", route.model_name);
+        assert_eq!(
+            target.api_key.is_some(),
+            has_key,
+            "route {}",
+            route.model_name
+        );
+    }
+}
+
+#[test]
 fn test_empty_model_list_rejected() {
     let env = mock_env();
     let yaml = r#"

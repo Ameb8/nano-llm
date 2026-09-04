@@ -4,6 +4,7 @@ use crate::config::runtime::{
     ProviderKind, RuntimeConfig, RuntimeGeneralSettings, RuntimeRoute, RuntimeTarget,
 };
 use crate::config::secrets::{resolve_secret, EnvProvider};
+use std::net::Ipv6Addr;
 
 /// Builds the immutable runtime configuration from parsed raw configuration and CLI flags.
 pub fn build_runtime_config<E: EnvProvider>(
@@ -357,17 +358,32 @@ fn validate_and_normalize_api_base(
     has_api_key: bool,
     path: &str,
 ) -> Result<String, ConfigError> {
+    let invalid_base = |reason: &str| {
+        ConfigError::new(
+            ConfigErrorKind::InvalidApiBase {
+                path: path.to_string(),
+                reason: reason.to_string(),
+            },
+            None,
+        )
+    };
+
+    if base
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_ascii_control())
+    {
+        return Err(invalid_base(
+            "api_base must not contain whitespace or control characters",
+        ));
+    }
+
     let (is_https, rest) = if let Some(r) = base.strip_prefix("https://") {
         (true, r)
     } else if let Some(r) = base.strip_prefix("http://") {
         (false, r)
     } else {
-        return Err(ConfigError::new(
-            ConfigErrorKind::InvalidApiBase {
-                path: path.to_string(),
-                reason: "api_base must be an absolute http or https URL".to_string(),
-            },
-            None,
+        return Err(invalid_base(
+            "api_base must be an absolute http or https URL",
         ));
     };
 
@@ -411,7 +427,7 @@ fn validate_and_normalize_api_base(
         ));
     }
 
-    let (host_port, _) = match rest.split_once('/') {
+    let (host_port, path_part) = match rest.split_once('/') {
         Some((h, p)) => (h, p),
         None => (rest, ""),
     };
@@ -436,21 +452,84 @@ fn validate_and_normalize_api_base(
         ));
     }
 
-    if host_port
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_ascii_control())
-    {
+    if !is_valid_url_authority(host_port) {
         return Err(ConfigError::new(
             ConfigErrorKind::InvalidApiBase {
                 path: path.to_string(),
-                reason: "api_base contains invalid host characters".to_string(),
+                reason: "api_base contains an invalid host or port".to_string(),
             },
             None,
         ));
     }
 
+    if path_part.contains('\\') || !has_valid_percent_escapes(path_part) {
+        return Err(invalid_base("api_base contains an invalid path"));
+    }
+
     let normalized = base.trim_end_matches('/').to_string();
     Ok(normalized)
+}
+
+fn is_valid_url_authority(authority: &str) -> bool {
+    let (host, port) = if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return false;
+        };
+        let host = &authority[1..end];
+        let remainder = &authority[end + 1..];
+        if host.parse::<Ipv6Addr>().is_err() {
+            return false;
+        }
+        match remainder.strip_prefix(':') {
+            Some(port) => (host, Some(port)),
+            None if remainder.is_empty() => (host, None),
+            None => return false,
+        }
+    } else {
+        let mut parts = authority.split(':');
+        let host = parts.next().unwrap_or_default();
+        let port = parts.next();
+        if parts.next().is_some() || host.is_empty() || host.contains(['[', ']', '\\']) {
+            return false;
+        }
+        (host, port)
+    };
+
+    if host.is_empty()
+        || host.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_ascii_control()
+                || matches!(c, '"' | '<' | '>' | '^' | '`' | '{' | '}' | '|')
+        })
+    {
+        return false;
+    }
+    match port {
+        Some(port) if !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) => {
+            port.parse::<u16>().is_ok()
+        }
+        None => true,
+        _ => false,
+    }
+}
+
+fn has_valid_percent_escapes(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -789,5 +868,35 @@ mod tests {
             err.kind,
             ConfigErrorKind::InvalidTargetModel { .. }
         ));
+    }
+
+    #[test]
+    fn test_api_base_rejects_malformed_authority_and_path() {
+        let env = mock_env();
+        for base in [
+            "https://example.test:not-a-port/v1",
+            "https://example.test:65536/v1",
+            "https://[::1/v1",
+            "https://[not-an-ip]/v1",
+            "https://example.test/v1%ZZ",
+            "https://example.test\\path",
+            "https://example.test\"/v1",
+        ] {
+            let raw = RawConfig {
+                general_settings: None,
+                model_list: vec![RawModelEntry {
+                    model_name: "custom".to_string(),
+                    litellm_params: RawLiteLlmParams {
+                        model: "openai_compatible/model".to_string(),
+                        api_key: None,
+                        api_base: Some(base.to_string()),
+                        timeout: None,
+                    },
+                }],
+            };
+            let err = build_runtime_config(raw, true, &env)
+                .expect_err("malformed api_base must fail at startup");
+            assert!(matches!(err.kind, ConfigErrorKind::InvalidApiBase { .. }));
+        }
     }
 }

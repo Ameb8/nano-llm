@@ -96,7 +96,7 @@ general_settings:
 }
 
 #[test]
-fn test_valid_optional_null_and_tilde_fields() {
+fn test_optional_string_fields_accept_null_but_integer_fields_reject_it() {
     let yaml = r#"
 model_list:
   - model_name: custom
@@ -104,18 +104,38 @@ model_list:
       model: openai_compatible/custom-model
       api_key: null
       api_base: ~
-      timeout: null
+      timeout: 30
 general_settings:
   master_key: null
-  request_timeout: ~
 "#;
-    let config = parse_yaml_str(yaml).expect("should parse config with null/tilde optionals");
+    let config = parse_yaml_str(yaml).expect("optional strings may be omitted with null");
     assert_eq!(config.model_list[0].litellm_params.api_key, None);
     assert_eq!(config.model_list[0].litellm_params.api_base, None);
-    assert_eq!(config.model_list[0].litellm_params.timeout, None);
+    assert_eq!(config.model_list[0].litellm_params.timeout, Some(30.0));
     let gs = config.general_settings.expect("general_settings present");
     assert_eq!(gs.master_key, None);
     assert_eq!(gs.request_timeout, None);
+
+    for (field, path) in [
+        ("timeout", "model_list[0].litellm_params.timeout"),
+        ("request_timeout", "general_settings.request_timeout"),
+        ("overall_timeout", "general_settings.overall_timeout"),
+        ("max_in_flight", "general_settings.max_in_flight"),
+    ] {
+        let yaml = if field == "timeout" {
+            format!(
+                "model_list:\n  - model_name: custom\n    litellm_params:\n      model: openai_compatible/model\n      {field}: null\n"
+            )
+        } else {
+            format!(
+                "model_list:\n  - model_name: custom\n    litellm_params:\n      model: openai_compatible/model\ngeneral_settings:\n  {field}: null\n"
+            )
+        };
+        let err = parse_yaml_str(&yaml).expect_err("documented integers cannot be null");
+        assert!(
+            matches!(err.kind, ConfigErrorKind::InvalidType { path: ref actual, .. } if actual == path)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,6 @@ pub use raw::{RawConfig, RawGeneralSettings, RawLiteLlmParams, RawModelEntry};
 pub use runtime::{
     ProviderKind, RuntimeConfig, RuntimeGeneralSettings, RuntimeRoute, RuntimeTarget,
 };
-pub use secrets::{resolve_secret, EnvProvider, SecretString, SystemEnv};
+pub use secrets::{resolve_secret, EnvLookupError, EnvProvider, SecretString, SystemEnv};
 pub use validate::build_runtime_config;
 pub use yaml::parse_yaml_str;

@@ -784,11 +784,7 @@ fn parse_optional_string(node: &SpannedNode, path: &str) -> Result<Option<String
 fn parse_optional_number(node: &SpannedNode, path: &str) -> Result<Option<f64>, ConfigError> {
     match node {
         SpannedNode::Scalar { value, style, .. } => {
-            if *style == ScalarStyle::Plain
-                && (value == "~" || value.eq_ignore_ascii_case("null") || value.is_empty())
-            {
-                Ok(None)
-            } else if *style == ScalarStyle::Plain && is_yaml_decimal_integer(value) {
+            if *style == ScalarStyle::Plain && is_yaml_decimal_integer(value) {
                 // `_` is legal YAML integer syntax but not Rust numeric syntax.
                 let num = value.replace('_', "").parse::<f64>().map_err(|_| {
                     ConfigError::new(
@@ -837,11 +833,7 @@ fn parse_optional_number(node: &SpannedNode, path: &str) -> Result<Option<f64>, 
 fn parse_optional_integer(node: &SpannedNode, path: &str) -> Result<Option<usize>, ConfigError> {
     match node {
         SpannedNode::Scalar { value, style, .. } => {
-            if *style == ScalarStyle::Plain
-                && (value == "~" || value.eq_ignore_ascii_case("null") || value.is_empty())
-            {
-                Ok(None)
-            } else if *style == ScalarStyle::Plain && is_yaml_decimal_integer(value) {
+            if *style == ScalarStyle::Plain && is_yaml_decimal_integer(value) {
                 let normalized = value.replace('_', "");
                 if let Ok(num) = normalized.parse::<usize>() {
                     Ok(Some(num))

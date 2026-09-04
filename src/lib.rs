@@ -4,8 +4,8 @@ pub mod config;
 pub use cli::{Cli, CliError, DEFAULT_BIND_ADDR, IS_DEV_BUILD};
 pub use config::{
     build_runtime_config, parse_yaml_str, ConfigError, ConfigErrorKind, ConfigLocation,
-    EnvProvider, ProviderKind, RawConfig, RuntimeConfig, RuntimeGeneralSettings, RuntimeRoute,
-    RuntimeTarget, SecretString, SystemEnv,
+    EnvLookupError, EnvProvider, ProviderKind, RawConfig, RuntimeConfig, RuntimeGeneralSettings,
+    RuntimeRoute, RuntimeTarget, SecretString, SystemEnv,
 };
 
 /// Returns the package version string.

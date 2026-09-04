@@ -5,6 +5,18 @@ use std::fmt;
 /// An environment variable provider abstraction for deterministic testing.
 pub trait EnvProvider {
     fn get_var(&self, key: &str) -> Option<String>;
+
+    /// Looks up a variable while preserving a non-UTF-8 environment value as a
+    /// distinct error. Custom test providers only need to implement `get_var`.
+    fn get_utf8_var(&self, key: &str) -> Result<Option<String>, EnvLookupError> {
+        Ok(self.get_var(key))
+    }
+}
+
+/// The only lookup failure that must be distinguished from an absent variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvLookupError {
+    NotUtf8,
 }
 
 /// Real system environment variable provider.
@@ -14,6 +26,14 @@ pub struct SystemEnv;
 impl EnvProvider for SystemEnv {
     fn get_var(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
+    }
+
+    fn get_utf8_var(&self, key: &str) -> Result<Option<String>, EnvLookupError> {
+        match std::env::var(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(EnvLookupError::NotUtf8),
+        }
     }
 }
 
@@ -71,25 +91,37 @@ pub fn resolve_secret<E: EnvProvider>(
         }
     };
 
-    if var_name.is_empty() {
+    if !is_valid_environment_name(var_name) {
         return Err(ConfigError::new(
             ConfigErrorKind::InvalidSecretReference {
                 path: path.to_string(),
-                reason: "environment variable name in 'os.environ/' must not be empty".to_string(),
+                reason: "environment variable name must match [A-Za-z_][A-Za-z0-9_]*".to_string(),
             },
             None,
         ));
     }
 
-    let secret_val = env.get_var(var_name).ok_or_else(|| {
-        ConfigError::new(
-            ConfigErrorKind::MissingEnvVar {
-                path: path.to_string(),
-                var_name: var_name.to_string(),
-            },
-            None,
-        )
-    })?;
+    let secret_val = env
+        .get_utf8_var(var_name)
+        .map_err(|EnvLookupError::NotUtf8| {
+            ConfigError::new(
+                ConfigErrorKind::InvalidSecretValue {
+                    path: path.to_string(),
+                    var_name: var_name.to_string(),
+                    reason: "resolved secret value is not valid UTF-8".to_string(),
+                },
+                None,
+            )
+        })?
+        .ok_or_else(|| {
+            ConfigError::new(
+                ConfigErrorKind::MissingEnvVar {
+                    path: path.to_string(),
+                    var_name: var_name.to_string(),
+                },
+                None,
+            )
+        })?;
 
     if secret_val.is_empty() {
         return Err(ConfigError::new(
@@ -125,6 +157,12 @@ pub fn resolve_secret<E: EnvProvider>(
     }
 
     Ok(SecretString::new(secret_val))
+}
+
+fn is_valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -169,6 +207,23 @@ mod tests {
             err.kind,
             ConfigErrorKind::InvalidSecretReference { .. }
         ));
+    }
+
+    #[test]
+    fn test_resolve_secret_rejects_non_exact_environment_reference() {
+        let env = HashMap::new();
+        for reference in [
+            "os.environ/KEY/extra",
+            "os.environ/1KEY",
+            "os.environ/KEY.NAME",
+        ] {
+            let err = resolve_secret(reference, "test.path", true, &env)
+                .expect_err("invalid environment reference must fail");
+            assert!(matches!(
+                err.kind,
+                ConfigErrorKind::InvalidSecretReference { .. }
+            ));
+        }
     }
 
     #[test]
@@ -228,5 +283,33 @@ mod tests {
         let res = resolve_secret("os.environ/UNICODE_VAR", "test.path", false, &env)
             .expect("should allow non-ascii for query transport (Gemini)");
         assert_eq!(res.expose_secret(), "gemini-key-🔑");
+    }
+
+    #[test]
+    fn test_secret_failures_name_the_path_and_variable_without_leaking_value() {
+        let secret = "do-not-expose-this-secret";
+        let mut env = HashMap::new();
+        env.insert("SECRET_KEY".to_string(), format!("{secret}\n"));
+
+        let err = resolve_secret(
+            "os.environ/SECRET_KEY",
+            "model_list[0].litellm_params.api_key",
+            true,
+            &env,
+        )
+        .expect_err("control character must be rejected");
+        let diagnostic = err.to_string();
+        assert!(diagnostic.contains("model_list[0].litellm_params.api_key"));
+        assert!(diagnostic.contains("SECRET_KEY"));
+        assert!(!diagnostic.contains(secret));
+
+        let inline = resolve_secret(
+            "do-not-expose-this-secret",
+            "general_settings.master_key",
+            true,
+            &env,
+        )
+        .expect_err("inline secret must be rejected");
+        assert!(!inline.to_string().contains(secret));
     }
 }

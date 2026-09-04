@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod config;
 pub mod request;
+pub mod response;
 
 pub use cli::{Cli, CliError, DEFAULT_BIND_ADDR, IS_DEV_BUILD};
 pub use config::{
@@ -11,6 +12,12 @@ pub use config::{
 pub use request::{
     decode_chat_request, decode_chat_request_for_route, CanonicalRequest, DecodeError, JsonValue,
     ToolChoice,
+};
+pub use response::{
+    build_response, normalize_response, normalize_usage, safety_response, AssistantDelta,
+    AssistantMessage, ChatChoice, ChatChunk, ChatResponse, ChunkChoice, FinishReason, FunctionCall,
+    NativeChoice, NativeResponse, NativeTerminal, NativeToolCall, ResponseError, ResponseMetadata,
+    StreamAssembler, ToolCall, ToolCallDelta, Usage,
 };
 
 /// Returns the package version string.

@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod providers;
 pub mod request;
 pub mod response;
 pub mod server;
@@ -9,6 +10,11 @@ pub use config::{
     build_runtime_config, parse_yaml_str, ConfigError, ConfigErrorKind, ConfigLocation,
     EnvLookupError, EnvProvider, ProviderKind, RawConfig, RuntimeConfig, RuntimeGeneralSettings,
     RuntimeRoute, RuntimeTarget, SecretString, SystemEnv,
+};
+pub use providers::{
+    build_provider, OutboundRequest, OutboundResponse, Provider, ProviderFuture, ProviderStream,
+    SecureTransportPolicy, TargetError, TargetErrorKind, TargetProvider, TransportError,
+    TransportErrorKind, TransportTlsVerification,
 };
 pub use request::{
     decode_chat_request, decode_chat_request_for_route, decode_json_object, CanonicalRequest,

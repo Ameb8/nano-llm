@@ -11,9 +11,10 @@ use crate::providers::{
 };
 use crate::request::{decode_json_value, CanonicalRequest, JsonValue, ToolChoice};
 use crate::response::{
-    build_response, normalize_usage, ChatResponse, NativeTerminal, NativeToolCall, ResponseError,
-    ResponseMetadata,
+    build_response, normalize_usage, AssistantDelta, ChatChunk, ChatResponse, NativeTerminal,
+    NativeToolCall, ResponseError, ResponseMetadata, StreamAssembler, ToolCallDelta,
 };
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// Anthropic Messages adapter for one validated target.
@@ -154,8 +155,368 @@ impl Provider for AnthropicProvider {
             if !(200..300).contains(&response.status) {
                 return Err(TargetError::from_upstream_status(response.status));
             }
-            Err(TargetError::invalid_response())
+            Ok(Box::new(AnthropicSseDecoder::new(
+                request.clone(),
+                ResponseMetadata::for_model(&request.model),
+                response.body,
+            )) as ProviderStream)
         })
+    }
+}
+
+/// Maximum decoded payload of one native SSE event.  Transport fragments have
+/// no framing significance and may split a field or JSON string anywhere.
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct BlockState {
+    kind: BlockKind,
+    call_index: Option<usize>,
+    arguments: String,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum BlockKind {
+    #[default]
+    Text,
+    Tool,
+}
+
+/// Strict incremental decoder for the Anthropic Messages SSE lifecycle.
+pub struct AnthropicSseDecoder {
+    source: crate::providers::OutboundByteStream,
+    assembler: StreamAssembler,
+    input: Vec<u8>,
+    data: Vec<u8>,
+    event: Option<String>,
+    pending: VecDeque<Result<ChatChunk, TargetError>>,
+    blocks: HashMap<usize, BlockState>,
+    next_block: usize,
+    next_call: usize,
+    started: bool,
+    saw_message_delta: bool,
+    saw_message_stop: bool,
+    done: bool,
+    exhausted: bool,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+impl AnthropicSseDecoder {
+    fn new(
+        request: CanonicalRequest,
+        metadata: ResponseMetadata,
+        source: crate::providers::OutboundByteStream,
+    ) -> Self {
+        Self {
+            source,
+            assembler: StreamAssembler::new(&request, metadata),
+            input: Vec::new(),
+            data: Vec::new(),
+            event: None,
+            pending: VecDeque::new(),
+            blocks: HashMap::new(),
+            next_block: 0,
+            next_call: 0,
+            started: false,
+            saw_message_delta: false,
+            saw_message_stop: false,
+            done: false,
+            exhausted: false,
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
+    fn invalid() -> TargetError {
+        TargetError::invalid_response()
+    }
+
+    fn line(&mut self, mut line: Vec<u8>) -> Result<(), TargetError> {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            return self.dispatch();
+        }
+        if line[0] == b':' {
+            return Ok(());
+        }
+        if let Some(value) = line.strip_prefix(b"event:") {
+            if self.event.is_some() {
+                return Err(Self::invalid());
+            }
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            self.event = Some(
+                std::str::from_utf8(value)
+                    .map_err(|_| Self::invalid())?
+                    .to_owned(),
+            );
+        } else if let Some(value) = line.strip_prefix(b"data:") {
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            let extra = value.len() + usize::from(!self.data.is_empty());
+            if self.data.len().saturating_add(extra) > MAX_SSE_EVENT_BYTES {
+                return Err(Self::invalid());
+            }
+            if !self.data.is_empty() {
+                self.data.push(b'\n');
+            }
+            self.data.extend_from_slice(value);
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self) -> Result<(), TargetError> {
+        if self.data.is_empty() {
+            self.event = None;
+            return Ok(());
+        }
+        let payload = std::mem::take(&mut self.data);
+        let event = self.event.take().ok_or_else(Self::invalid)?;
+        if self.done {
+            return Err(Self::invalid());
+        }
+        let value = crate::request::decode_json_object(&payload).map_err(|_| Self::invalid())?;
+        if !matches!(get(&value, "type"), Some(JsonValue::String(kind)) if kind == &event) {
+            return Err(Self::invalid());
+        }
+        match event.as_str() {
+            "message_start" => self.message_start(&value),
+            "content_block_start" => self.block_start(&value),
+            "content_block_delta" => self.block_delta(&value),
+            "content_block_stop" => self.block_stop(&value),
+            "message_delta" => self.message_delta(&value),
+            "message_stop" => self.message_stop(&value),
+            _ => Err(Self::invalid()),
+        }
+    }
+
+    fn message_start(&mut self, value: &[(String, JsonValue)]) -> Result<(), TargetError> {
+        if self.started || self.saw_message_delta || self.saw_message_stop {
+            return Err(Self::invalid());
+        }
+        let message = object(required(value, "message")?)?;
+        if !matches!(get(message, "type"), Some(JsonValue::String(kind)) if kind == "message")
+            || !matches!(get(message, "role"), Some(JsonValue::String(role)) if role == "assistant")
+        {
+            return Err(Self::invalid());
+        }
+        if let Some(usage) = get(message, "usage") {
+            self.input_tokens = usage_count(usage, "input_tokens");
+        }
+        self.started = true;
+        // The shared assembler synthesizes the first role on the first
+        // observable delta.  Deferring it lets a terminal refusal become the
+        // single required role-bearing terminal chunk.
+        Ok(())
+    }
+
+    fn block_start(&mut self, value: &[(String, JsonValue)]) -> Result<(), TargetError> {
+        if !self.started || self.saw_message_delta {
+            return Err(Self::invalid());
+        }
+        let index =
+            usize::try_from(unsigned(required(value, "index")?)?).map_err(|_| Self::invalid())?;
+        if index != self.next_block {
+            return Err(Self::invalid());
+        }
+        let block = object(required(value, "content_block")?)?;
+        let kind = string(required(block, "type")?)?;
+        let mut state = BlockState::default();
+        let mut delta = AssistantDelta::default();
+        match kind {
+            "text" => {
+                state.kind = BlockKind::Text;
+                if let Some(text) = get(block, "text") {
+                    delta.content = Some(string(text)?.to_owned());
+                }
+            }
+            "tool_use" => {
+                state.kind = BlockKind::Tool;
+                let id = match get(block, "id") {
+                    None => None,
+                    Some(JsonValue::String(id)) => Some(id.clone()),
+                    _ => return Err(Self::invalid()),
+                };
+                let name = string(required(block, "name")?)?.to_owned();
+                // Anthropic starts streamed tools with an empty object and sends
+                // the actual object incrementally as input_json_delta fragments.
+                if !matches!(get(block, "input"), Some(JsonValue::Object(input)) if input.is_empty())
+                {
+                    return Err(Self::invalid());
+                }
+                state.call_index = Some(self.next_call);
+                self.next_call += 1;
+                delta.tool_calls.push(ToolCallDelta {
+                    index: state.call_index.unwrap(),
+                    id,
+                    r#type: Some("function"),
+                    name: Some(name),
+                    arguments: None,
+                });
+            }
+            _ => return Err(Self::invalid()),
+        }
+        self.blocks.insert(index, state);
+        self.next_block += 1;
+        self.push(delta, None)
+    }
+
+    fn block_delta(&mut self, value: &[(String, JsonValue)]) -> Result<(), TargetError> {
+        if !self.started || self.saw_message_delta {
+            return Err(Self::invalid());
+        }
+        let index =
+            usize::try_from(unsigned(required(value, "index")?)?).map_err(|_| Self::invalid())?;
+        let state = self.blocks.get_mut(&index).ok_or_else(Self::invalid)?;
+        let delta = object(required(value, "delta")?)?;
+        let (content, arguments) = match state.kind {
+            BlockKind::Text => match string(required(delta, "type")?)? {
+                "text_delta" => (Some(string(required(delta, "text")?)?.to_owned()), None),
+                _ => return Err(Self::invalid()),
+            },
+            BlockKind::Tool => match string(required(delta, "type")?)? {
+                "input_json_delta" => (
+                    None,
+                    Some(string(required(delta, "partial_json")?)?.to_owned()),
+                ),
+                _ => return Err(Self::invalid()),
+            },
+        };
+        if let Some(arguments) = &arguments {
+            state.arguments.push_str(arguments);
+        }
+        let mut output = AssistantDelta {
+            content,
+            ..Default::default()
+        };
+        if let Some(arguments) = arguments {
+            output.tool_calls.push(ToolCallDelta {
+                index: state.call_index.unwrap(),
+                id: None,
+                r#type: None,
+                name: None,
+                arguments: Some(arguments),
+            });
+        }
+        self.push(output, None)
+    }
+
+    fn block_stop(&mut self, value: &[(String, JsonValue)]) -> Result<(), TargetError> {
+        if !self.started || self.saw_message_delta {
+            return Err(Self::invalid());
+        }
+        let index =
+            usize::try_from(unsigned(required(value, "index")?)?).map_err(|_| Self::invalid())?;
+        let state = self.blocks.remove(&index).ok_or_else(Self::invalid)?;
+        if state.kind == BlockKind::Tool {
+            let parsed =
+                decode_json_value(state.arguments.as_bytes()).map_err(|_| Self::invalid())?;
+            if !matches!(parsed, JsonValue::Object(_)) {
+                return Err(Self::invalid());
+            }
+        }
+        Ok(())
+    }
+
+    fn message_delta(&mut self, value: &[(String, JsonValue)]) -> Result<(), TargetError> {
+        if !self.started || self.saw_message_delta || !self.blocks.is_empty() {
+            return Err(Self::invalid());
+        }
+        let delta = object(required(value, "delta")?)?;
+        let reason = string(required(delta, "stop_reason")?)?;
+        if let Some(usage) = get(value, "usage") {
+            self.output_tokens = usage_count(usage, "output_tokens");
+        }
+        self.saw_message_delta = true;
+        self.push(AssistantDelta::default(), Some(terminal(reason)))
+    }
+
+    fn message_stop(&mut self, _value: &[(String, JsonValue)]) -> Result<(), TargetError> {
+        if !self.saw_message_delta || self.saw_message_stop {
+            return Err(Self::invalid());
+        }
+        self.saw_message_stop = true;
+        self.assembler.finish().map_err(response_error)?;
+        self.done = true;
+        if let Some(usage) = normalize_usage(
+            self.input_tokens.map(u128::from),
+            self.output_tokens.map(u128::from),
+        ) {
+            if let Some(chunk) = self.assembler.usage_chunk(usage).map_err(response_error)? {
+                self.pending.push_back(Ok(chunk));
+            }
+        }
+        Ok(())
+    }
+
+    fn push(
+        &mut self,
+        delta: AssistantDelta,
+        terminal: Option<NativeTerminal>,
+    ) -> Result<(), TargetError> {
+        if let Some(chunk) = self
+            .assembler
+            .push(0, delta, terminal)
+            .map_err(response_error)?
+        {
+            self.pending.push_back(Ok(chunk));
+        }
+        Ok(())
+    }
+
+    fn next_event(&mut self) -> Result<bool, TargetError> {
+        loop {
+            if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<_> = self.input.drain(..=newline).collect();
+                self.line(line[..line.len() - 1].to_vec())?;
+                return Ok(true);
+            }
+            match self.source.next() {
+                Some(Ok(bytes)) => {
+                    if self.input.len().saturating_add(bytes.len())
+                        > MAX_SSE_EVENT_BYTES + 64 * 1024
+                    {
+                        return Err(Self::invalid());
+                    }
+                    self.input.extend_from_slice(&bytes);
+                }
+                Some(Err(_)) => return Err(TargetError::connection()),
+                None => {
+                    self.exhausted = true;
+                    if !self.input.is_empty() || !self.data.is_empty() || !self.done {
+                        return Err(Self::invalid());
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for AnthropicSseDecoder {
+    type Item = Result<ChatChunk, TargetError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.pending.pop_front() {
+            return Some(item);
+        }
+        if self.exhausted {
+            return None;
+        }
+        loop {
+            match self.next_event() {
+                Ok(false) => return self.pending.pop_front(),
+                Ok(true) => {
+                    if let Some(item) = self.pending.pop_front() {
+                        return Some(item);
+                    }
+                }
+                Err(error) => {
+                    self.exhausted = true;
+                    return Some(Err(error));
+                }
+            }
+        }
     }
 }
 
@@ -253,6 +614,15 @@ fn parse_usage(value: &JsonValue) -> Option<crate::response::Usage> {
         get(usage, "input_tokens").and_then(unsigned_optional),
         get(usage, "output_tokens").and_then(unsigned_optional),
     )
+}
+
+/// A streaming usage update carries input and output counts in separate
+/// lifecycle events, so retain each valid component until `message_stop`.
+fn usage_count(value: &JsonValue, name: &str) -> Option<u64> {
+    let JsonValue::Object(fields) = value else {
+        return None;
+    };
+    get(fields, name).and_then(|value| unsigned(value).ok())
 }
 
 fn unsigned_optional(value: &JsonValue) -> Option<u128> {
@@ -766,6 +1136,111 @@ mod tests {
         ));
         let body = crate::request::decode_json_object(&transport.request().body).unwrap();
         assert_eq!(field(&body, "stream"), Some(&JsonValue::Bool(true)));
+    }
+
+    fn stream_request(include_usage: bool, tools: bool) -> CanonicalRequest {
+        let body = match (include_usage, tools) {
+            (true, true) => {
+                r#"{"model":"public","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"stream":true,"stream_options":{"include_usage":true},"tools":[{"type":"function","function":{"name":"weather"}}],"tool_choice":"auto"}"#
+            }
+            (false, false) => {
+                r#"{"model":"public","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"stream":true}"#
+            }
+            _ => unreachable!(),
+        };
+        decode_chat_request(body.as_bytes()).unwrap()
+    }
+
+    fn decode_native(
+        request: CanonicalRequest,
+        frames: &[&str],
+    ) -> Vec<Result<ChatChunk, TargetError>> {
+        let source = frames
+            .iter()
+            .map(|frame| Ok(frame.as_bytes().to_vec()))
+            .collect::<Vec<_>>()
+            .into_iter();
+        AnthropicSseDecoder::new(
+            request,
+            ResponseMetadata::for_model("public"),
+            Box::new(source),
+        )
+        .collect()
+    }
+
+    #[test]
+    fn streaming_translates_fragmented_text_tools_and_usage() {
+        let frames = [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":2}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hel\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"native\",\"name\":\"weather\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+        // Deliberately split inside both a JSON object and an SSE field.
+        let joined = frames.concat();
+        let split = [&joined[..97], &joined[97..401], &joined[401..]];
+        let output = decode_native(stream_request(true, true), &split);
+        assert!(output.iter().all(Result::is_ok));
+        let output: Vec<_> = output.into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            output.last().unwrap().usage.as_ref().unwrap().total_tokens,
+            5
+        );
+        let terminal = &output[5];
+        assert_eq!(
+            terminal.choices[0].finish_reason.unwrap().as_str(),
+            "tool_calls"
+        );
+        let tool = &output[2].choices[0].delta.tool_calls[0];
+        assert_eq!(tool.index, 0);
+        assert_eq!(tool.id.as_deref(), Some("native"));
+        assert_eq!(tool.name.as_deref(), Some("weather"));
+        assert_eq!(
+            output[4].choices[0].delta.tool_calls[0]
+                .arguments
+                .as_deref(),
+            Some("}")
+        );
+    }
+
+    #[test]
+    fn streaming_refusal_is_a_single_role_bearing_content_filter_terminal() {
+        let output = decode_native(stream_request(false, false), &[
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ]);
+        assert_eq!(output.len(), 1);
+        let chunk = output[0].as_ref().unwrap();
+        assert_eq!(chunk.choices[0].delta.role, Some("assistant"));
+        assert_eq!(
+            chunk.choices[0].finish_reason.unwrap().as_str(),
+            "content_filter"
+        );
+    }
+
+    #[test]
+    fn streaming_rejects_missing_repeated_inconsistent_and_post_terminal_state() {
+        let start = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n";
+        let terminal = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+        let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let text_start = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"x\"}}\n\n";
+        for frames in [
+            vec![start],
+            vec![start, terminal, stop, stop],
+            vec![start, text_start, terminal],
+            vec![start, terminal, stop, text_start],
+            vec![start, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"}}\n\n"],
+        ] {
+            let output = decode_native(stream_request(false, false), &frames);
+            assert!(matches!(output.last(), Some(Err(error)) if error.kind == crate::providers::TargetErrorKind::InvalidResponse));
+        }
     }
 
     fn completion_request(with_tools: bool) -> CanonicalRequest {

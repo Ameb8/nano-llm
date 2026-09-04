@@ -5,11 +5,13 @@
 //! credentials, and their particular HTTP representation.
 
 use crate::config::{ProviderKind, RuntimeTarget};
+use crate::openai_compatible::OpenAiCompatibleProvider;
 use crate::request::CanonicalRequest;
 use crate::response::{ChatChunk, ChatResponse};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// A future returned by an object-safe provider operation.
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -77,6 +79,12 @@ impl TargetError {
 
     pub const fn invalid_response() -> Self {
         Self::new(TargetErrorKind::InvalidResponse, None)
+    }
+
+    /// A provider-native operational exhaustion reported in an otherwise
+    /// successful HTTP response.
+    pub const fn overloaded() -> Self {
+        Self::new(TargetErrorKind::Overloaded, None)
     }
 
     /// Classify an upstream HTTP status without retaining its body.
@@ -266,6 +274,26 @@ pub fn build_provider(target: RuntimeTarget) -> Box<dyn Provider> {
         | ProviderKind::OpenAiCompatible
         | ProviderKind::Anthropic
         | ProviderKind::Gemini => Box::new(TargetProvider::from_validated(target)),
+    }
+}
+
+/// Construct a provider using the adapter-owned outbound transport.  Tests and
+/// the eventual HTTP runtime use this seam to capture the exact provider wire
+/// request without exposing it to router code.
+pub fn build_provider_with_transport(
+    target: RuntimeTarget,
+    transport: Arc<dyn OutboundTransport>,
+) -> Box<dyn Provider> {
+    match target.provider {
+        ProviderKind::OpenAi
+        | ProviderKind::Mistral
+        | ProviderKind::DeepSeek
+        | ProviderKind::OpenAiCompatible => {
+            Box::new(OpenAiCompatibleProvider::new(target, transport))
+        }
+        ProviderKind::Anthropic | ProviderKind::Gemini => {
+            Box::new(TargetProvider::from_validated(target))
+        }
     }
 }
 

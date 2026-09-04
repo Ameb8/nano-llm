@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod openai_compatible;
 pub mod providers;
 pub mod request;
 pub mod response;
@@ -11,10 +12,12 @@ pub use config::{
     EnvLookupError, EnvProvider, ProviderKind, RawConfig, RuntimeConfig, RuntimeGeneralSettings,
     RuntimeRoute, RuntimeTarget, SecretString, SystemEnv,
 };
+pub use openai_compatible::{OpenAiCompatibleProvider, MAX_BUFFERED_RESPONSE_BYTES};
 pub use providers::{
-    build_provider, OutboundRequest, OutboundResponse, Provider, ProviderFuture, ProviderStream,
-    SecureTransportPolicy, TargetError, TargetErrorKind, TargetProvider, TransportError,
-    TransportErrorKind, TransportTlsVerification,
+    build_provider, build_provider_with_transport, OutboundRequest, OutboundResponse,
+    OutboundTransport, Provider, ProviderFuture, ProviderStream, SecureTransportPolicy,
+    TargetError, TargetErrorKind, TargetProvider, TransportError, TransportErrorKind,
+    TransportTlsVerification,
 };
 pub use request::{
     decode_chat_request, decode_chat_request_for_route, decode_json_object, CanonicalRequest,

@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod request;
 pub mod response;
+pub mod server;
 
 pub use cli::{Cli, CliError, DEFAULT_BIND_ADDR, IS_DEV_BUILD};
 pub use config::{
@@ -19,6 +20,7 @@ pub use response::{
     NativeChoice, NativeResponse, NativeTerminal, NativeToolCall, ResponseError, ResponseMetadata,
     StreamAssembler, ToolCall, ToolCallDelta, Usage,
 };
+pub use server::{app, Application, GatewayError, GatewayErrorKind, HttpRequest, HttpResponse};
 
 /// Returns the package version string.
 pub fn version() -> &'static str {

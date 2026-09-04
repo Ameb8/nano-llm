@@ -11,8 +11,8 @@ pub use config::{
     RuntimeRoute, RuntimeTarget, SecretString, SystemEnv,
 };
 pub use request::{
-    decode_chat_request, decode_chat_request_for_route, CanonicalRequest, DecodeError, JsonValue,
-    ToolChoice,
+    decode_chat_request, decode_chat_request_for_route, decode_json_object, CanonicalRequest,
+    DecodeError, JsonValue, ToolChoice,
 };
 pub use response::{
     build_response, normalize_response, normalize_usage, safety_response, AssistantDelta,

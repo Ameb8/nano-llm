@@ -88,6 +88,17 @@ impl std::error::Error for DecodeError {}
 /// Values in `tools[].function.parameters` are retained as opaque JSON Schema,
 /// except that JSON syntax and duplicate-member checks still apply there.
 pub fn decode_chat_request(bytes: &[u8]) -> Result<CanonicalRequest, DecodeError> {
+    let fields = decode_json_object(bytes)?;
+    validate_top(&fields)?;
+    canonicalize(fields)
+}
+
+/// Decode exactly one UTF-8 JSON object without applying chat semantics.
+///
+/// The HTTP ingestion layer uses this boundary before route selection.  It
+/// deliberately retains duplicate-member detection from the canonical parser,
+/// while leaving request-shape validation to the later canonicalization stage.
+pub fn decode_json_object(bytes: &[u8]) -> Result<Vec<(String, JsonValue)>, DecodeError> {
     let text = std::str::from_utf8(bytes).map_err(|_| DecodeError::InvalidJson {
         message: "request body is not valid UTF-8".into(),
     })?;
@@ -105,8 +116,7 @@ pub fn decode_chat_request(bytes: &[u8]) -> Result<CanonicalRequest, DecodeError
             message: "request JSON must be an object".into(),
         });
     };
-    validate_top(&fields)?;
-    canonicalize(fields)
+    Ok(fields)
 }
 
 /// Decode and validate a request against the selected immutable fallback route.

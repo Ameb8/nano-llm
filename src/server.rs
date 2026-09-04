@@ -1,11 +1,17 @@
 //! Dependency-free inbound HTTP contract and router-level test seam.
 
 use crate::config::RuntimeConfig;
+use crate::request::{decode_json_object, DecodeError};
 use std::fmt::Write;
 use std::fs::File;
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An inbound request whose headers retain every raw field occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +19,9 @@ pub struct HttpRequest {
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, Vec<u8>)>,
+    /// Fully buffered inbound body at this dependency-free router seam.
+    pub body: Vec<u8>,
+    body_chunks: Option<Vec<(Duration, Vec<u8>)>>,
 }
 
 impl HttpRequest {
@@ -21,11 +30,31 @@ impl HttpRequest {
             method: method.into(),
             path: path.into(),
             headers: Vec::new(),
+            body: Vec::new(),
+            body_chunks: None,
         }
     }
 
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Attach an inbound body. Network adapters must enforce the same fixed
+    /// 30-second complete-buffer deadline before constructing this request.
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    /// Attach a body as chunks whose offsets are measured from permit
+    /// acquisition. This lets a transport adapter preserve the body deadline
+    /// without exposing its reader implementation to routing code.
+    pub fn with_body_chunks<I>(mut self, chunks: I) -> Self
+    where
+        I: IntoIterator<Item = (Duration, Vec<u8>)>,
+    {
+        self.body_chunks = Some(chunks.into_iter().collect());
         self
     }
 
@@ -122,11 +151,17 @@ impl GatewayError {
 pub struct Application {
     config: RuntimeConfig,
     no_auth: bool,
+    generation_capacity: Arc<GenerationCapacity>,
 }
 
 /// Construct an application from immutable, validated configuration.
 pub fn app(config: RuntimeConfig, no_auth: bool) -> Application {
-    Application { config, no_auth }
+    let max_in_flight = config.general_settings.max_in_flight;
+    Application {
+        config,
+        no_auth,
+        generation_capacity: Arc::new(GenerationCapacity::new(max_in_flight)),
+    }
 }
 
 impl Application {
@@ -145,12 +180,7 @@ impl Application {
             } else if request.path == "/v1/models" && request.method == "GET" {
                 self.models_response()
             } else if request.path == "/v1/chat/completions" && request.method == "POST" {
-                // Provider dispatch is outside this slice. Do not invent a success path.
-                error_response(GatewayError::new(
-                    GatewayErrorKind::UpstreamExhausted,
-                    "All configured upstream targets failed",
-                    None,
-                ))
+                self.chat_response(request)
             } else {
                 route_not_found()
             }
@@ -168,8 +198,52 @@ impl Application {
             return false;
         };
         let values: Vec<_> = request.headers_named("authorization").collect();
-        values.len() == 1
-            && values[0] == format!("Bearer {}", master_key.expose_secret()).as_bytes()
+        values.len() == 1 && exact_bearer_matches(values[0], master_key.expose_secret().as_bytes())
+    }
+
+    fn chat_response(&self, request: &HttpRequest) -> HttpResponse {
+        if !valid_json_content_type(request) {
+            return error_response(GatewayError::new(
+                GatewayErrorKind::UnsupportedMediaType,
+                "Unsupported media type",
+                None,
+            ));
+        }
+
+        let Some(_permit) = self.generation_capacity.try_acquire() else {
+            return error_response(GatewayError::new(
+                GatewayErrorKind::CapacityExhausted,
+                "Generation capacity exhausted",
+                None,
+            ));
+        };
+
+        let body = match buffer_body(request) {
+            Ok(body) => body,
+            Err(kind) => {
+                return error_response(GatewayError::new(
+                    kind,
+                    match kind {
+                        GatewayErrorKind::RequestBodyTimeout => "Request body timed out",
+                        GatewayErrorKind::RequestTooLarge => "Request body is too large",
+                        _ => unreachable!("body buffering returns only body-limit errors"),
+                    },
+                    None,
+                ))
+            }
+        };
+        if let Err(error) = decode_json_object(&body) {
+            return decode_error_response(error);
+        }
+
+        // Canonical semantic validation, routing, and provider dispatch are
+        // intentionally subsequent slices. Holding `_permit` through this
+        // terminal path verifies its lifetime boundary now.
+        error_response(GatewayError::new(
+            GatewayErrorKind::UpstreamExhausted,
+            "All configured upstream targets failed",
+            None,
+        ))
     }
 
     fn models_response(&self) -> HttpResponse {
@@ -188,6 +262,131 @@ impl Application {
         }
         body.push_str("]}");
         json_response(200, body)
+    }
+}
+
+fn buffer_body(request: &HttpRequest) -> Result<Vec<u8>, GatewayErrorKind> {
+    let Some(chunks) = request.body_chunks.as_deref() else {
+        if request.body.len() > MAX_REQUEST_BODY_BYTES {
+            return Err(GatewayErrorKind::RequestTooLarge);
+        }
+        return Ok(request.body.clone());
+    };
+
+    let mut body = Vec::new();
+    for (arrival, chunk) in chunks {
+        // A chunk that arrives after the deadline cannot make its size breach
+        // win; the timeout happened first. At exactly 30 seconds the deadline
+        // wins deterministically as well.
+        if *arrival >= REQUEST_BODY_TIMEOUT {
+            return Err(GatewayErrorKind::RequestBodyTimeout);
+        }
+        if body.len().saturating_add(chunk.len()) > MAX_REQUEST_BODY_BYTES {
+            return Err(GatewayErrorKind::RequestTooLarge);
+        }
+        body.extend_from_slice(chunk);
+    }
+    Ok(body)
+}
+
+fn decode_error_response(error: DecodeError) -> HttpResponse {
+    let (kind, message, param) = match error {
+        DecodeError::InvalidJson { message } => (GatewayErrorKind::InvalidJson, message, None),
+        DecodeError::Validation { message, param } => {
+            (GatewayErrorKind::InvalidRequest, message, param)
+        }
+    };
+    error_response(GatewayError::new(kind, message, param))
+}
+
+fn exact_bearer_matches(value: &[u8], expected: &[u8]) -> bool {
+    let Some(space) = value.iter().position(|byte| *byte == b' ') else {
+        return false;
+    };
+    if !value[..space].eq_ignore_ascii_case(b"Bearer") {
+        return false;
+    }
+    constant_time_eq(&value[space + 1..], expected)
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_length = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_length {
+        difference |= usize::from(*left.get(index).unwrap_or(&0) ^ *right.get(index).unwrap_or(&0));
+    }
+    difference == 0
+}
+
+fn valid_json_content_type(request: &HttpRequest) -> bool {
+    let values: Vec<_> = request.headers_named("content-type").collect();
+    values.len() == 1 && valid_json_media_type(values[0])
+}
+
+fn valid_json_media_type(value: &[u8]) -> bool {
+    let Ok(value) = std::str::from_utf8(value) else {
+        return false;
+    };
+    let mut parts = value.split(';');
+    let Some(media_type) = parts.next() else {
+        return false;
+    };
+    if !media_type
+        .trim_matches([' ', '\t'])
+        .eq_ignore_ascii_case("application/json")
+    {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, None) => true,
+        (Some(parameter), None) => {
+            let mut pair = parameter.trim_matches([' ', '\t']).split('=');
+            matches!(
+                (pair.next(), pair.next(), pair.next()),
+                (Some(name), Some(value), None)
+                    if name.trim_matches([' ', '\t']).eq_ignore_ascii_case("charset")
+                        && value.trim_matches([' ', '\t']).eq_ignore_ascii_case("utf-8")
+            )
+        }
+        _ => false,
+    }
+}
+
+struct GenerationCapacity {
+    available: AtomicUsize,
+}
+
+impl GenerationCapacity {
+    fn new(limit: usize) -> Self {
+        Self {
+            available: AtomicUsize::new(limit),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<GenerationPermit> {
+        let mut available = self.available.load(Ordering::Acquire);
+        loop {
+            if available == 0 {
+                return None;
+            }
+            match self.available.compare_exchange_weak(
+                available,
+                available - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(GenerationPermit(self.clone())),
+                Err(current) => available = current,
+            }
+        }
+    }
+}
+
+struct GenerationPermit(Arc<GenerationCapacity>);
+
+impl Drop for GenerationPermit {
+    fn drop(&mut self) {
+        self.0.available.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -265,4 +464,125 @@ fn json_escape(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{RuntimeGeneralSettings, RuntimeRoute};
+    use crate::SecretString;
+
+    fn application(no_auth: bool, max_in_flight: usize) -> Application {
+        app(
+            RuntimeConfig {
+                general_settings: RuntimeGeneralSettings {
+                    master_key: Some(SecretString::new("master-key".into())),
+                    max_in_flight,
+                    ..RuntimeGeneralSettings::default()
+                },
+                routes: Vec::<RuntimeRoute>::new(),
+            },
+            no_auth,
+        )
+    }
+
+    fn chat() -> HttpRequest {
+        HttpRequest::new("POST", "/v1/chat/completions")
+            .with_header("authorization", "Bearer master-key")
+            .with_header("content-type", "application/json")
+            .with_body(br#"{}"#.to_vec())
+    }
+
+    #[test]
+    fn authentication_is_exact_and_precedes_every_chat_gate() {
+        let application = application(false, 1);
+        for authorization in [
+            None,
+            Some("Bearer"),
+            Some("Bearer\tmaster-key"),
+            Some("Basic master-key"),
+            Some("Bearer wrong"),
+        ] {
+            let mut request = HttpRequest::new("POST", "/v1/chat/completions")
+                .with_header("content-type", "text/plain")
+                .with_body(vec![b'x'; MAX_REQUEST_BODY_BYTES + 1]);
+            if let Some(value) = authorization {
+                request = request.with_header("authorization", value);
+            }
+            assert_eq!(application.handle(&request).status, 401);
+        }
+        let repeated = HttpRequest::new("POST", "/v1/chat/completions")
+            .with_header("authorization", "Bearer master-key")
+            .with_header("authorization", "Bearer master-key");
+        assert_eq!(application.handle(&repeated).status, 401);
+        assert_eq!(application.handle(&chat()).status, 502);
+    }
+
+    #[test]
+    fn content_type_is_strict_and_precedes_capacity_and_body() {
+        let application = application(false, 1);
+        for content_type in [
+            "application/json, text/plain",
+            "application/json; charset=utf-8; boundary=x",
+            "application/json; charset=latin1",
+            "text/plain",
+        ] {
+            let request = HttpRequest::new("POST", "/v1/chat/completions")
+                .with_header("authorization", "Bearer master-key")
+                .with_header("content-type", content_type)
+                .with_body(vec![b'x'; MAX_REQUEST_BODY_BYTES + 1]);
+            assert_eq!(application.handle(&request).status, 415, "{content_type}");
+        }
+        let repeated = chat().with_header("content-type", "application/json");
+        assert_eq!(application.handle(&repeated).status, 415);
+        let charset = HttpRequest::new("POST", "/v1/chat/completions")
+            .with_header("authorization", "bEaReR master-key")
+            .with_header("content-type", "APPLICATION/JSON; CHARSET=UTF-8")
+            .with_body(br#"{}"#.to_vec());
+        assert_eq!(application.handle(&charset).status, 502);
+    }
+
+    #[test]
+    fn buffering_limits_and_all_early_paths_release_the_permit() {
+        let application = application(false, 1);
+        let cases = [
+            chat().with_body(vec![b'x'; MAX_REQUEST_BODY_BYTES + 1]),
+            chat().with_body(b"not json".to_vec()),
+            chat().with_body_chunks([(Duration::from_secs(31), br#"{}"#.to_vec())]),
+            chat().with_body_chunks([(
+                Duration::from_secs(29),
+                vec![b'x'; MAX_REQUEST_BODY_BYTES + 1],
+            )]),
+            chat().with_body_chunks([(
+                Duration::from_secs(31),
+                vec![b'x'; MAX_REQUEST_BODY_BYTES + 1],
+            )]),
+        ];
+        let expected = [413, 400, 408, 413, 408];
+        for (request, status) in cases.into_iter().zip(expected) {
+            assert_eq!(application.handle(&request).status, status);
+            let permit = application
+                .generation_capacity
+                .try_acquire()
+                .expect("terminal response must release the permit");
+            drop(permit);
+        }
+    }
+
+    #[test]
+    fn exhausted_capacity_never_enters_chat_but_public_routes_bypass_it() {
+        let application = application(false, 1);
+        let permit = application.generation_capacity.try_acquire().unwrap();
+        assert_eq!(application.handle(&chat()).status, 503);
+        assert_eq!(
+            application
+                .handle(&HttpRequest::new("GET", "/health"))
+                .status,
+            200
+        );
+        let models =
+            HttpRequest::new("GET", "/v1/models").with_header("authorization", "Bearer master-key");
+        assert_eq!(application.handle(&models).status, 200);
+        drop(permit);
+    }
 }

@@ -4,6 +4,7 @@
 //! one immutable canonical request and calls this trait; adapters own URL,
 //! credentials, and their particular HTTP representation.
 
+use crate::anthropic::AnthropicProvider;
 use crate::config::{ProviderKind, RuntimeTarget};
 use crate::openai_compatible::OpenAiCompatibleProvider;
 use crate::request::CanonicalRequest;
@@ -315,9 +316,8 @@ pub fn build_provider_with_transport(
         | ProviderKind::OpenAiCompatible => {
             Box::new(OpenAiCompatibleProvider::new(target, transport))
         }
-        ProviderKind::Anthropic | ProviderKind::Gemini => {
-            Box::new(TargetProvider::from_validated(target))
-        }
+        ProviderKind::Anthropic => Box::new(AnthropicProvider::new(target, transport)),
+        ProviderKind::Gemini => Box::new(TargetProvider::from_validated(target)),
     }
 }
 

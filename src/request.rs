@@ -144,6 +144,27 @@ pub fn decode_json_object(bytes: &[u8]) -> Result<Vec<(String, JsonValue)>, Deco
     Ok(fields)
 }
 
+/// Decode exactly one UTF-8 JSON value while retaining object member order.
+///
+/// Provider adapters use this only for route-validated historical tool
+/// arguments, whose canonical representation is an OpenAI JSON string but
+/// whose native provider representation is an object.
+pub fn decode_json_value(bytes: &[u8]) -> Result<JsonValue, DecodeError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| DecodeError::InvalidJson {
+        message: "request body is not valid UTF-8".into(),
+    })?;
+    let mut parser = Parser::new(text);
+    parser.ws();
+    let value = parser.value("", None)?;
+    parser.ws();
+    if !parser.eof() {
+        return Err(DecodeError::InvalidJson {
+            message: "request body contains trailing data".into(),
+        });
+    }
+    Ok(value)
+}
+
 /// Decode and validate a request against the selected immutable fallback route.
 ///
 /// This is deliberately separate from JSON decoding because only the selected

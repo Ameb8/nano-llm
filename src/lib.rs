@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod cli;
 pub mod config;
 pub mod openai_compatible;
@@ -6,6 +7,7 @@ pub mod request;
 pub mod response;
 pub mod server;
 
+pub use anthropic::AnthropicProvider;
 pub use cli::{Cli, CliError, DEFAULT_BIND_ADDR, IS_DEV_BUILD};
 pub use config::{
     build_runtime_config, parse_yaml_str, ConfigError, ConfigErrorKind, ConfigLocation,
@@ -23,7 +25,8 @@ pub use providers::{
 };
 pub use request::{
     decode_chat_request, decode_chat_request_fields, decode_chat_request_for_route,
-    decode_json_object, requested_model, CanonicalRequest, DecodeError, JsonValue, ToolChoice,
+    decode_json_object, decode_json_value, requested_model, CanonicalRequest, DecodeError,
+    JsonValue, ToolChoice,
 };
 pub use response::{
     build_response, normalize_response, normalize_usage, safety_response, AssistantDelta,

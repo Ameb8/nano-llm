@@ -10,7 +10,10 @@ use crate::providers::{
     SecureTransportPolicy, TargetError, TransportErrorKind,
 };
 use crate::request::{decode_json_value, CanonicalRequest, JsonValue, ToolChoice};
-use crate::response::ChatResponse;
+use crate::response::{
+    normalize_response, normalize_usage, safety_response, ChatResponse, NativeChoice,
+    NativeResponse, NativeTerminal, NativeToolCall, ResponseError, ResponseMetadata, Usage,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -112,8 +115,15 @@ impl Provider for GeminiProvider {
             if !(200..300).contains(&response.status) {
                 return Err(TargetError::from_upstream_status(response.status));
             }
-            // Gemini response translation is explicitly outside this slice.
-            Err(TargetError::invalid_response())
+            if response.body.len() > MAX_BUFFERED_RESPONSE_BYTES {
+                return Err(TargetError::invalid_response());
+            }
+            let metadata = ResponseMetadata::for_model(&request.model);
+            match parse_response(&response.body)? {
+                ParsedResponse::Candidate(native) => normalize_response(request, metadata, native),
+                ParsedResponse::SafetyBlock { usage } => safety_response(request, metadata, usage),
+            }
+            .map_err(response_error)
         })
     }
 
@@ -133,6 +143,206 @@ impl Provider for GeminiProvider {
             Err(TargetError::invalid_response())
         })
     }
+}
+
+/// Keep a buffered provider response bounded before decoding it.  Gemini SSE
+/// uses a separate decoder and is deliberately not covered by this limit.
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+enum ParsedResponse {
+    Candidate(NativeResponse),
+    /// Gemini can block a prompt before constructing any candidate.  This is
+    /// the only no-candidate response which is a canonical success.
+    SafetyBlock {
+        usage: Option<Usage>,
+    },
+}
+
+fn response_error(error: ResponseError) -> TargetError {
+    match error {
+        ResponseError::Overloaded => TargetError::overloaded(),
+        ResponseError::InvalidResponse(_) => TargetError::invalid_response(),
+    }
+}
+
+/// Decode Gemini's buffered `generateContent` response into gateway-native
+/// response inputs.  Fields outside the canonical contract are deliberately
+/// ignored, but every field used to establish output semantics is strict.
+fn parse_response(bytes: &[u8]) -> Result<ParsedResponse, TargetError> {
+    let root =
+        crate::request::decode_json_object(bytes).map_err(|_| TargetError::invalid_response())?;
+    let usage = match field(&root, "usageMetadata") {
+        None | Some(JsonValue::Null) => None,
+        Some(value) => parse_usage(value),
+    };
+
+    match field(&root, "candidates") {
+        Some(JsonValue::Array(candidates)) if candidates.len() == 1 => {
+            Ok(ParsedResponse::Candidate(NativeResponse {
+                choices: vec![parse_candidate(&candidates[0])?],
+                usage,
+            }))
+        }
+        // Gemini provides this explicit signal when a prompt is blocked before
+        // it has a candidate.  An empty or missing array on its own is never a
+        // successful completion.
+        None | Some(JsonValue::Array(_)) if explicit_policy_block(&root) => {
+            Ok(ParsedResponse::SafetyBlock { usage })
+        }
+        _ => Err(TargetError::invalid_response()),
+    }
+}
+
+fn parse_candidate(value: &JsonValue) -> Result<NativeChoice, TargetError> {
+    let candidate = object(value)?;
+    if let Some(index) = field(candidate, "index") {
+        if unsigned(index)? != 0 {
+            return Err(TargetError::invalid_response());
+        }
+    }
+    let content = object(required(candidate, "content")?)?;
+    match field(content, "role") {
+        None => {}
+        Some(JsonValue::String(role)) if role == "model" => {}
+        _ => return Err(TargetError::invalid_response()),
+    }
+    let parts = array(required(content, "parts")?)?;
+    if parts.is_empty() {
+        return Err(TargetError::invalid_response());
+    }
+    let (content, calls) = parse_parts(parts)?;
+    let terminal = match required(candidate, "finishReason")? {
+        JsonValue::String(reason) => terminal(reason),
+        _ => return Err(TargetError::invalid_response()),
+    };
+    Ok(NativeChoice {
+        index: 0,
+        content,
+        calls,
+        terminal,
+    })
+}
+
+/// Canonical output has one text field and an ordered call list.  Text parts
+/// therefore concatenate in native order without introducing content.
+fn parse_parts(parts: &[JsonValue]) -> Result<(Option<String>, Vec<NativeToolCall>), TargetError> {
+    let mut text = String::new();
+    let mut saw_text = false;
+    let mut calls = Vec::new();
+    for part in parts {
+        let part = object(part)?;
+        match (field(part, "text"), field(part, "functionCall")) {
+            (Some(JsonValue::String(value)), None) => {
+                text.push_str(value);
+                saw_text = true;
+            }
+            (None, Some(value)) => {
+                let call = object(value)?;
+                let id = match field(call, "id") {
+                    None => None,
+                    Some(JsonValue::String(id)) => Some(id.clone()),
+                    Some(_) => return Err(TargetError::invalid_response()),
+                };
+                let name = string(required(call, "name")?)?.to_owned();
+                let JsonValue::Object(arguments) = required(call, "args")? else {
+                    return Err(TargetError::invalid_response());
+                };
+                calls.push(NativeToolCall {
+                    id,
+                    name,
+                    arguments: encode(&JsonValue::Object(arguments.clone())),
+                });
+            }
+            // A native part cannot represent two canonical outputs at once,
+            // and v0.1 has no counterpart for any other Gemini part type.
+            _ => return Err(TargetError::invalid_response()),
+        }
+    }
+    Ok((saw_text.then_some(text), calls))
+}
+
+fn parse_usage(value: &JsonValue) -> Option<Usage> {
+    let JsonValue::Object(usage) = value else {
+        return None;
+    };
+    normalize_usage(
+        field(usage, "promptTokenCount").and_then(unsigned_optional),
+        field(usage, "candidatesTokenCount").and_then(unsigned_optional),
+    )
+}
+
+fn unsigned_optional(value: &JsonValue) -> Option<u128> {
+    let JsonValue::Number(value) = value else {
+        return None;
+    };
+    if value.contains(['.', 'e', 'E']) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn explicit_policy_block(root: &[(String, JsonValue)]) -> bool {
+    let Some(JsonValue::Object(feedback)) = field(root, "promptFeedback") else {
+        return false;
+    };
+    matches!(field(feedback, "blockReason"),
+        Some(JsonValue::String(reason)) if matches!(reason.as_str(),
+            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "IMAGE_SAFETY" | "JAILBREAK" | "MODEL_ARMOR" | "OTHER"))
+}
+
+fn terminal(reason: &str) -> NativeTerminal {
+    match reason {
+        "STOP" => NativeTerminal::Stop,
+        "MAX_TOKENS" => NativeTerminal::Length,
+        "SAFETY" | "RECITATION" | "LANGUAGE" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => {
+            NativeTerminal::ContentFilter
+        }
+        "MALFORMED_FUNCTION_CALL"
+        | "UNEXPECTED_TOOL_CALL"
+        | "TOO_MANY_TOOL_CALLS"
+        | "MISSING_THOUGHT_SIGNATURE"
+        | "MALFORMED_RESPONSE"
+        | "FINISH_REASON_UNSPECIFIED" => NativeTerminal::Invalid,
+        _ => NativeTerminal::Unknown,
+    }
+}
+
+fn required<'a>(
+    fields: &'a [(String, JsonValue)],
+    name: &str,
+) -> Result<&'a JsonValue, TargetError> {
+    field(fields, name).ok_or_else(TargetError::invalid_response)
+}
+
+fn object(value: &JsonValue) -> Result<&[(String, JsonValue)], TargetError> {
+    match value {
+        JsonValue::Object(fields) => Ok(fields),
+        _ => Err(TargetError::invalid_response()),
+    }
+}
+
+fn array(value: &JsonValue) -> Result<&[JsonValue], TargetError> {
+    match value {
+        JsonValue::Array(values) => Ok(values),
+        _ => Err(TargetError::invalid_response()),
+    }
+}
+
+fn string(value: &JsonValue) -> Result<&str, TargetError> {
+    match value {
+        JsonValue::String(value) => Ok(value),
+        _ => Err(TargetError::invalid_response()),
+    }
+}
+
+fn unsigned(value: &JsonValue) -> Result<u64, TargetError> {
+    let JsonValue::Number(value) = value else {
+        return Err(TargetError::invalid_response());
+    };
+    if value.contains(['.', 'e', 'E']) {
+        return Err(TargetError::invalid_response());
+    }
+    value.parse().map_err(|_| TargetError::invalid_response())
 }
 
 /// URL components are kept distinct until final serialization. The configured
@@ -628,6 +838,128 @@ mod tests {
                 field(functions, "mode"),
                 Some(&JsonValue::String(mode.into()))
             );
+        }
+    }
+
+    fn normalized(source: &str, payload: &str) -> Result<ChatResponse, TargetError> {
+        let request = decode_chat_request(source.as_bytes()).unwrap();
+        let metadata = ResponseMetadata::for_model(&request.model);
+        match parse_response(payload.as_bytes())? {
+            ParsedResponse::Candidate(native) => normalize_response(&request, metadata, native),
+            ParsedResponse::SafetyBlock { usage } => safety_response(&request, metadata, usage),
+        }
+        .map_err(response_error)
+    }
+
+    #[test]
+    fn normalizes_one_candidate_text_calls_ids_and_usage() {
+        let response = normalized(
+            r#"{"model":"public","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"weather"}}]}"#,
+            r#"{"candidates":[{"index":0,"content":{"parts":[{"text":"The "},{"text":"forecast:"},{"functionCall":{"id":"native","name":"weather","args":{"city":"Paris","days":2}}},{"functionCall":{"id":"native","name":"weather","args":{}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"totalTokenCount":999}}"#,
+        )
+        .unwrap();
+        assert_eq!(response.choices.len(), 1);
+        let choice = &response.choices[0];
+        assert_eq!(choice.index, 0);
+        assert_eq!(choice.message.content.as_deref(), Some("The forecast:"));
+        assert_eq!(choice.finish_reason.as_str(), "tool_calls");
+        let calls = choice.message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].id, "native");
+        assert!(calls[1].id.starts_with("call_"));
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_eq!(calls[0].function.arguments, r#"{"city":"Paris","days":2}"#);
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                total_tokens: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn maps_every_gemini_finish_reason_and_rejects_protocol_reasons() {
+        let request = r#"{"model":"public","messages":[{"role":"user","content":"hi"}]}"#;
+        for (native, canonical) in [
+            ("STOP", "stop"),
+            ("MAX_TOKENS", "length"),
+            ("SAFETY", "content_filter"),
+            ("RECITATION", "content_filter"),
+            ("LANGUAGE", "content_filter"),
+            ("BLOCKLIST", "content_filter"),
+            ("PROHIBITED_CONTENT", "content_filter"),
+            ("SPII", "content_filter"),
+            ("unrecognized_future_reason", "stop"),
+        ] {
+            let payload = format!(
+                r#"{{"candidates":[{{"content":{{"parts":[{{"text":"x"}}]}},"finishReason":"{native}"}}]}}"#
+            );
+            assert_eq!(
+                normalized(request, &payload).unwrap().choices[0]
+                    .finish_reason
+                    .as_str(),
+                canonical
+            );
+        }
+        for native in [
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+            "MISSING_THOUGHT_SIGNATURE",
+            "MALFORMED_RESPONSE",
+            "FINISH_REASON_UNSPECIFIED",
+        ] {
+            let payload = format!(
+                r#"{{"candidates":[{{"content":{{"parts":[{{"text":"x"}}]}},"finishReason":"{native}"}}]}}"#
+            );
+            assert!(matches!(normalized(request, &payload), Err(error)
+                if error.kind == crate::providers::TargetErrorKind::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn only_explicit_prompt_policy_blocks_can_synthesize_a_choice() {
+        let request = r#"{"model":"public","messages":[{"role":"user","content":"hi"}]}"#;
+        let blocked = normalized(
+            request,
+            r#"{"promptFeedback":{"blockReason":"SAFETY"},"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(blocked.choices[0].finish_reason.as_str(), "content_filter");
+        assert_eq!(blocked.choices[0].message.content, None);
+        assert_eq!(blocked.choices[0].message.tool_calls, None);
+        assert_eq!(blocked.usage.as_ref().unwrap().total_tokens, 2);
+
+        for payload in [
+            r#"{}"#,
+            r#"{"candidates":[]}"#,
+            r#"{"promptFeedback":{"blockReason":"BLOCK_REASON_UNSPECIFIED"}}"#,
+            r#"{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}"#,
+            r#"{"candidates":[{"content":{"role":"user","parts":[{"text":"x"}]},"finishReason":"STOP"}]}"#,
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"missing_args"}}]},"finishReason":"STOP"}]}"#,
+        ] {
+            assert!(matches!(normalized(request, payload), Err(error)
+                if error.kind == crate::providers::TargetErrorKind::InvalidResponse));
+        }
+    }
+
+    #[test]
+    fn omits_invalid_usage_and_rejects_noncanonical_candidate_sets() {
+        let request = r#"{"model":"public","messages":[{"role":"user","content":"hi"}]}"#;
+        let omitted = normalized(
+            request,
+            r#"{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(omitted.usage, None);
+        for payload in [
+            r#"{"candidates":[{"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"},{"content":{"parts":[{"text":"y"}]},"finishReason":"STOP"}]}"#,
+            r#"{"candidates":[{"index":1,"content":{"parts":[{"text":"x"}]},"finishReason":"STOP"}]}"#,
+            r#"{"candidates":[{"content":{"parts":[{"text":"x"}]}}]}"#,
+        ] {
+            assert!(matches!(normalized(request, payload), Err(error)
+                if error.kind == crate::providers::TargetErrorKind::InvalidResponse));
         }
     }
 }

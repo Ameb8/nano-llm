@@ -14,6 +14,9 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+
+const MAX_BUFFERED_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// A future returned by an object-safe provider operation.
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -263,6 +266,128 @@ pub trait OutboundTransport: Send + Sync {
     }
 }
 
+/// Production HTTP(S) transport. TLS is provided by Rustls with WebPKI roots
+/// compiled into the binary; redirect handling is disabled on every client.
+///
+/// The provider factory gives each target its validated attempt timeout. This
+/// keeps the router-facing provider contract free of HTTP concerns while
+/// ensuring a blocked connect or read cannot exceed that target's budget.
+pub struct ProductionTransport {
+    client: reqwest::blocking::Client,
+}
+
+impl ProductionTransport {
+    pub fn new(timeout: Duration) -> Result<Self, TransportError> {
+        let client = reqwest::blocking::Client::builder()
+            .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::none())
+            // Provider traffic is direct. Ambient proxy environment variables
+            // would otherwise be an undocumented credential forwarding path.
+            .no_proxy()
+            .timeout(timeout)
+            .build()
+            .map_err(|_| TransportError {
+                kind: TransportErrorKind::Connection,
+            })?;
+        Ok(Self { client })
+    }
+
+    fn send(
+        &self,
+        request: OutboundRequest,
+    ) -> Result<reqwest::blocking::Response, TransportError> {
+        let method =
+            reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|_| TransportError {
+                kind: TransportErrorKind::Connection,
+            })?;
+        let mut builder = self.client.request(method, &request.url).body(request.body);
+        for (name, value) in request.headers {
+            builder = builder.header(name, value);
+        }
+        builder.send().map_err(|error| TransportError {
+            kind: if error.is_timeout() {
+                TransportErrorKind::Timeout
+            } else {
+                TransportErrorKind::Connection
+            },
+        })
+    }
+}
+
+struct ResponseStream(reqwest::blocking::Response);
+
+impl Iterator for ResponseStream {
+    type Item = Result<Vec<u8>, TransportError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::io::Read;
+        let mut bytes = vec![0; 16 * 1024];
+        match self.0.read(&mut bytes) {
+            Ok(0) => None,
+            Ok(count) => {
+                bytes.truncate(count);
+                Some(Ok(bytes))
+            }
+            Err(error) => Some(Err(TransportError {
+                kind: if error.kind() == std::io::ErrorKind::TimedOut {
+                    TransportErrorKind::Timeout
+                } else {
+                    TransportErrorKind::Connection
+                },
+            })),
+        }
+    }
+}
+
+impl OutboundTransport for ProductionTransport {
+    fn execute(
+        &self,
+        policy: SecureTransportPolicy,
+        request: OutboundRequest,
+    ) -> Result<OutboundResponse, TransportError> {
+        debug_assert_eq!(
+            policy.tls_verification,
+            TransportTlsVerification::BundledRoots
+        );
+        debug_assert!(!policy.follow_redirects);
+        use std::io::Read;
+        let response = self.send(request)?;
+        let status = response.status().as_u16();
+        // Read at most one byte beyond the cap. This bound applies while data
+        // is arriving, rather than after an unbounded allocation has happened.
+        let mut body = Vec::with_capacity(MAX_BUFFERED_RESPONSE_BYTES as usize);
+        let mut limited = response.take(MAX_BUFFERED_RESPONSE_BYTES + 1);
+        limited
+            .read_to_end(&mut body)
+            .map_err(|error| TransportError {
+                kind: if error.kind() == std::io::ErrorKind::TimedOut {
+                    TransportErrorKind::Timeout
+                } else {
+                    TransportErrorKind::Connection
+                },
+            })?;
+        Ok(OutboundResponse { status, body })
+    }
+
+    fn execute_stream(
+        &self,
+        policy: SecureTransportPolicy,
+        request: OutboundRequest,
+    ) -> Result<OutboundStreamResponse, TransportError> {
+        debug_assert_eq!(
+            policy.tls_verification,
+            TransportTlsVerification::BundledRoots
+        );
+        debug_assert!(!policy.follow_redirects);
+        let response = self.send(request)?;
+        let status = response.status().as_u16();
+        Ok(OutboundStreamResponse {
+            status,
+            body: Box::new(ResponseStream(response)),
+        })
+    }
+}
+
 /// A target-bound provider construction. The target is copied only after
 /// configuration validation; credentials remain private and redacted by their
 /// `SecretString` implementation.
@@ -293,14 +418,13 @@ impl TargetProvider {
 /// request and response translation is intentionally deferred; the family is
 /// selected here, outside the router-facing [`Provider`] trait.
 pub fn build_provider(target: RuntimeTarget) -> Box<dyn Provider> {
-    match target.provider {
-        ProviderKind::OpenAi
-        | ProviderKind::Mistral
-        | ProviderKind::DeepSeek
-        | ProviderKind::OpenAiCompatible
-        | ProviderKind::Anthropic
-        | ProviderKind::Gemini => Box::new(TargetProvider::from_validated(target)),
-    }
+    let timeout = Duration::from_secs(target.timeout);
+    // Client construction cannot fail for the fixed production policy. Keep a
+    // deterministic non-placeholder failure should a future library version
+    // reject it rather than silently restoring the old fake provider.
+    let transport = ProductionTransport::new(timeout)
+        .expect("fixed production HTTP transport configuration is valid");
+    build_provider_with_transport(target, Arc::new(transport))
 }
 
 /// Construct a provider using the adapter-owned outbound transport.  Tests and
@@ -344,6 +468,11 @@ mod tests {
     use crate::config::SecretString;
     use crate::request::decode_chat_request;
     use crate::response::{ChatChoice, FinishReason};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     fn target(secret: &str) -> RuntimeTarget {
         RuntimeTarget {
@@ -474,6 +603,95 @@ mod tests {
         let provider: Box<dyn Provider> = Box::new(FakeProvider);
         let response = crate::providers::tests::block_on(provider.complete(&request)).unwrap();
         assert_eq!(response.model, "public");
+    }
+
+    #[test]
+    fn default_factory_reaches_a_keyless_controlled_upstream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = socket.read(&mut chunk).unwrap();
+                bytes.extend_from_slice(&chunk[..count]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            captured_tx.send(String::from_utf8(bytes).unwrap()).unwrap();
+            let body = br#"{"id":"upstream-id","object":"chat.completion","created":1,"model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
+        });
+        let provider = build_provider(RuntimeTarget {
+            model: "openai_compatible/gpt-test".into(),
+            provider: ProviderKind::OpenAiCompatible,
+            model_suffix: "gpt-test".into(),
+            api_key: None,
+            api_base: format!("http://{address}"),
+            timeout: 5,
+            explicit_timeout: None,
+        });
+        let request = decode_chat_request(
+            br#"{"model":"public-alias","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        let response = block_on(provider.complete(&request)).unwrap();
+        assert_eq!(response.model, "public-alias");
+        let captured = captured_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(captured.starts_with("POST /chat/completions HTTP/1.1\r\n"));
+        assert!(captured.contains("\r\ncontent-type: application/json\r\n"));
+        assert!(!captured.to_ascii_lowercase().contains("authorization:"));
+        assert!(captured.contains("\"model\":\"gpt-test\""));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn production_transport_does_not_follow_redirects() {
+        let receiver = TcpListener::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let redirect_target = receiver.local_addr().unwrap();
+        let redirector = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirector_address = redirector.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = redirector.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 256];
+            loop {
+                let count = socket.read(&mut chunk).unwrap();
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(socket, "HTTP/1.1 302 Found\r\nlocation: http://{redirect_target}/next\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").unwrap();
+        });
+        let transport = ProductionTransport::new(Duration::from_secs(2)).unwrap();
+        let response = transport
+            .execute(
+                SecureTransportPolicy::default(),
+                OutboundRequest {
+                    method: "POST",
+                    url: format!("http://{redirector_address}/start"),
+                    headers: vec![("Authorization".into(), "Bearer must-not-forward".into())],
+                    body: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(response.status, 302);
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(receiver.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        worker.join().unwrap();
     }
 
     fn block_on<T>(mut future: Pin<Box<dyn Future<Output = T> + Send + '_>>) -> T {

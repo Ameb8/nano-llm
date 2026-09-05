@@ -21,9 +21,9 @@ pub use openai_compatible::{
 };
 pub use providers::{
     build_provider, build_provider_with_transport, OutboundByteStream, OutboundRequest,
-    OutboundResponse, OutboundStreamResponse, OutboundTransport, Provider, ProviderFuture,
-    ProviderStream, SecureTransportPolicy, TargetError, TargetErrorKind, TargetProvider,
-    TransportError, TransportErrorKind, TransportTlsVerification,
+    OutboundResponse, OutboundStreamResponse, OutboundTransport, ProductionTransport, Provider,
+    ProviderFuture, ProviderStream, SecureTransportPolicy, TargetError, TargetErrorKind,
+    TargetProvider, TransportError, TransportErrorKind, TransportTlsVerification,
 };
 pub use request::{
     decode_chat_request, decode_chat_request_fields, decode_chat_request_for_route,

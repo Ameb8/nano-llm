@@ -12,6 +12,14 @@ on:
       - src/**
 
 jobs:
+  executable-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: task executable-matrix
+
   static-artifact:
     strategy:
       fail-fast: false

@@ -8,6 +8,8 @@ target/
 .env.*
 !.env.example
 *.pem
+!tests/fixtures/executable-tls/
+!tests/fixtures/executable-tls/*.pem
 *.key
 *.cert
 *.crt

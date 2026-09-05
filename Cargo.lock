@@ -399,6 +399,8 @@ version = "0.1.0-dev"
 dependencies = [
  "clap",
  "reqwest",
+ "rustls",
+ "rustls-pemfile",
  "saphyr-parser",
  "tracing",
  "tracing-subscriber",

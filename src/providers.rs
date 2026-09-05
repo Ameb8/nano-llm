@@ -278,17 +278,33 @@ pub struct ProductionTransport {
 
 impl ProductionTransport {
     pub fn new(timeout: Duration) -> Result<Self, TransportError> {
-        let client = reqwest::blocking::Client::builder()
+        let mut builder = reqwest::blocking::Client::builder()
             .use_rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
             // Provider traffic is direct. Ambient proxy environment variables
             // would otherwise be an undocumented credential forwarding path.
             .no_proxy()
-            .timeout(timeout)
-            .build()
-            .map_err(|_| TransportError {
-                kind: TransportErrorKind::Connection,
-            })?;
+            .timeout(timeout);
+        // The process fixture has a loopback certificate signed by its test
+        // CA. Debug builds may add that CA as a root; Rustls still verifies
+        // both the certificate chain and hostname. Release artifacts never
+        // compile this branch and use only the bundled WebPKI roots.
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(path) = std::env::var("NANO_LLM_EXECUTABLE_TEST_CA_PEM") {
+                let pem = std::fs::read(path).map_err(|_| TransportError {
+                    kind: TransportErrorKind::Connection,
+                })?;
+                let certificate =
+                    reqwest::Certificate::from_pem(&pem).map_err(|_| TransportError {
+                        kind: TransportErrorKind::Connection,
+                    })?;
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        let client = builder.build().map_err(|_| TransportError {
+            kind: TransportErrorKind::Connection,
+        })?;
         Ok(Self { client })
     }
 

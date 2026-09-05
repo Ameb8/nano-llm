@@ -114,6 +114,17 @@ fn serve_connection(mut stream: TcpStream, application: Application) {
     let Ok(request) = read_http_request(&mut stream) else {
         return;
     };
+    if let Some(result) = application.begin_socket_stream(&request) {
+        match result {
+            Ok(delivery) => {
+                delivery.write_to(&mut stream);
+            }
+            Err(response) => {
+                let _ = write_http_response(&mut stream, &response);
+            }
+        }
+        return;
+    }
     let response = application.handle(&request);
     let _ = write_http_response(&mut stream, &response);
 }
@@ -278,6 +289,17 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::R
         response.body.len()
     )?;
     stream.write_all(&response.body)
+}
+
+/// Write the commitment point for an SSE response.  Unlike ordinary responses
+/// this deliberately has no Content-Length: every following write is observed
+/// by the peer as the selected canonical stream makes progress.
+fn write_sse_head(stream: &mut TcpStream, response: &HttpResponse) -> io::Result<()> {
+    write!(stream, "HTTP/1.1 {} OK\r\n", response.status)?;
+    for (name, value) in &response.headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "connection: close\r\n\r\n")
 }
 
 #[cfg(unix)]
@@ -876,6 +898,101 @@ impl Application {
             response
         };
         with_request_id(response, request_id)
+    }
+
+    /// Start only a request that is known to be a valid streaming chat
+    /// request.  Returning `None` leaves ordinary handling (including all
+    /// validation errors) on the long-standing materialized response seam.
+    /// A selected stream is intentionally returned, not consumed here, so no
+    /// downstream bytes exist until the listener has its first chunk.
+    fn begin_socket_stream(
+        &self,
+        request: &HttpRequest,
+    ) -> Option<Result<SocketStreamDelivery, HttpResponse>> {
+        if request.path != "/v1/chat/completions"
+            || request.method != "POST"
+            || !self.is_authenticated(request)
+            || !valid_json_content_type(request)
+        {
+            return None;
+        }
+        // Decode before taking the special delivery path.  Invalid requests
+        // retain the existing error/permit behavior in `handle`.
+        let body = buffer_body(request).ok()?;
+        let fields = decode_json_object(&body).ok()?;
+        let model = requested_model(&fields).ok()?;
+        let route = self.config.get_route(&model)?;
+        let canonical = decode_chat_request_fields(fields).ok()?;
+        if !canonical.stream || canonical.validate_for_route(route).is_err() {
+            return None;
+        }
+
+        let request_id = select_request_id(request);
+        let request_span = tracing::info_span!("request", request_id = %request_id);
+        let _request_guard = request_span.enter();
+        let started = Instant::now();
+        let Some(permit) = self.generation_capacity.try_acquire() else {
+            return Some(Err(with_request_id(
+                error_response(GatewayError::new(
+                    GatewayErrorKind::CapacityExhausted,
+                    "Generation capacity exhausted",
+                    None,
+                )),
+                request_id,
+            )));
+        };
+        match self.dispatch_stream_route(route, &canonical, &request.cancellation) {
+            Ok(dispatch) => {
+                let context = CompletionContext::from_diagnostics(&dispatch.diagnostics);
+                emit_attempt_failures(&dispatch.attempts);
+                Some(Ok(SocketStreamDelivery {
+                    dispatch,
+                    _permit: permit,
+                    response: with_request_id(empty_sse_response(), request_id),
+                    started,
+                    context,
+                }))
+            }
+            Err(exhausted) => {
+                emit_attempt_failures(&exhausted.attempts);
+                let (error, outcome) = if exhausted.overall_timeout {
+                    (
+                        GatewayError::new(
+                            GatewayErrorKind::OverallTimeout,
+                            "Overall request timed out",
+                            None,
+                        ),
+                        "overall_timeout",
+                    )
+                } else if exhausted.cancelled {
+                    (
+                        GatewayError::new(
+                            GatewayErrorKind::UpstreamExhausted,
+                            "All configured upstream targets failed",
+                            None,
+                        ),
+                        "client_disconnected",
+                    )
+                } else {
+                    (
+                        GatewayError::new(
+                            GatewayErrorKind::UpstreamExhausted,
+                            "All configured upstream targets failed",
+                            None,
+                        ),
+                        "upstream_exhausted",
+                    )
+                };
+                let response = with_request_id(error_response(error), request_id);
+                emit_completion(
+                    &response,
+                    outcome,
+                    started,
+                    &CompletionContext::from_diagnostics(&exhausted.diagnostics),
+                );
+                Some(Err(response))
+            }
+        }
     }
 
     fn is_authenticated(&self, request: &HttpRequest) -> bool {
@@ -1478,6 +1595,44 @@ impl Drop for GenerationPermit {
     }
 }
 
+/// A selected stream plus every resource whose lifetime must extend through
+/// downstream delivery.  In particular, retaining the permit here prevents a
+/// slow client from admitting another generation before this one is finished.
+struct SocketStreamDelivery {
+    dispatch: StreamRouteDispatch,
+    _permit: GenerationPermit,
+    response: HttpResponse,
+    started: Instant,
+    context: CompletionContext,
+}
+
+impl SocketStreamDelivery {
+    fn write_to(mut self, stream: &mut TcpStream) {
+        let outcome = if write_sse_head(stream, &self.response).is_ok() {
+            write_sse_stream(stream, &mut self.dispatch)
+        } else {
+            self.dispatch.cancellation.cancel();
+            StreamCompletionOutcome::ClientDisconnected
+        };
+        if matches!(outcome, StreamCompletionOutcome::UpstreamFailedAfterCommit) {
+            tracing::warn!(
+                event = "request_failed",
+                outcome = %outcome.as_str(),
+                status = 200
+            );
+        }
+        emit_completion(
+            &self.response,
+            outcome.as_str(),
+            self.started,
+            &self.context,
+        );
+        // `dispatch` (and therefore its upstream iterator) drops before the
+        // permit. This is the common cleanup path for EOF, decode failure,
+        // write failure, timeout, and downstream cancellation.
+    }
+}
+
 fn select_request_id(request: &HttpRequest) -> String {
     let values: Vec<_> = request.headers_named(REQUEST_ID_HEADER).collect();
     if values.len() == 1
@@ -1661,6 +1816,66 @@ impl StreamCompletionOutcome {
             Self::Completed => "completed",
             Self::ClientDisconnected => "client_disconnected",
             Self::UpstreamFailedAfterCommit => "upstream_failed_after_commit",
+        }
+    }
+}
+
+/// Deliver a committed stream directly to the socket.  At most one encoded
+/// event is allocated at a time; `write_all` supplies natural TCP backpressure
+/// instead of building an unbounded application queue.
+fn write_sse_stream(
+    stream: &mut TcpStream,
+    dispatch: &mut StreamRouteDispatch,
+) -> StreamCompletionOutcome {
+    let expected = StreamMetadata::from(&dispatch.first_chunk);
+    let mut state = match StreamSuccessState::first(&dispatch.first_chunk, dispatch.include_usage) {
+        Some(state) => state,
+        None => return StreamCompletionOutcome::UpstreamFailedAfterCommit,
+    };
+    let mut event = String::new();
+    serialize_sse_chunk(&mut event, &dispatch.first_chunk);
+    if stream.write_all(event.as_bytes()).is_err() {
+        dispatch.cancellation.cancel();
+        return StreamCompletionOutcome::ClientDisconnected;
+    }
+    let mut idle_deadline = dispatch.clock.now().saturating_add(dispatch.idle_timeout);
+    loop {
+        if dispatch.cancellation.is_cancelled() {
+            return StreamCompletionOutcome::ClientDisconnected;
+        }
+        if dispatch.clock.now() >= idle_deadline {
+            return StreamCompletionOutcome::UpstreamFailedAfterCommit;
+        }
+        let item = dispatch.stream.next();
+        if dispatch.cancellation.is_cancelled() {
+            return StreamCompletionOutcome::ClientDisconnected;
+        }
+        if dispatch.clock.now() >= idle_deadline {
+            return StreamCompletionOutcome::UpstreamFailedAfterCommit;
+        }
+        let Some(item) = item else {
+            if state.terminal && stream.write_all(b"data: [DONE]\n\n").is_ok() {
+                return StreamCompletionOutcome::Completed;
+            }
+            if state.terminal {
+                dispatch.cancellation.cancel();
+                return StreamCompletionOutcome::ClientDisconnected;
+            }
+            return StreamCompletionOutcome::UpstreamFailedAfterCommit;
+        };
+        match item {
+            Ok(chunk) if state.accept(&chunk, &expected) => {
+                event.clear();
+                serialize_sse_chunk(&mut event, &chunk);
+                if stream.write_all(event.as_bytes()).is_err() {
+                    dispatch.cancellation.cancel();
+                    return StreamCompletionOutcome::ClientDisconnected;
+                }
+                if !chunk.choices.is_empty() {
+                    idle_deadline = dispatch.clock.now().saturating_add(dispatch.idle_timeout);
+                }
+            }
+            Ok(_) | Err(_) => return StreamCompletionOutcome::UpstreamFailedAfterCommit,
         }
     }
 }

@@ -954,6 +954,10 @@ fn request_logs_are_complete_safe_and_include_safe_attempt_diagnostics() {
         .with_writer(capture.clone())
         .finish();
     let response = tracing::subscriber::with_default(subscriber, || {
+        // Parallel tests may previously have evaluated these callsites under
+        // the no-op dispatcher. Refresh them after this scoped capture is
+        // active so this test observes the application's completion record.
+        tracing::callsite::rebuild_interest_cache();
         application(
             vec![target("first"), target("fallback")],
             Arc::new(Mutex::new(Vec::new())),
@@ -993,6 +997,7 @@ fn request_logs_are_complete_safe_and_include_safe_attempt_diagnostics() {
         .with_writer(health_capture.clone())
         .finish();
     tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
         application(
             vec![target("only")],
             Arc::new(Mutex::new(Vec::new())),

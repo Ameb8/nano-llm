@@ -1,0 +1,6 @@
+[env]
+# Tests intentionally capture the process-wide tracing callsite registry with
+# scoped subscribers. Running those captures concurrently lets one test cache
+# the no-op subscriber for another test's callsite. Keep the contract suite
+# deterministic until logging uses a process-global test collector.
+RUST_TEST_THREADS = "1"

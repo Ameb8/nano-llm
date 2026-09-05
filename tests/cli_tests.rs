@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -217,6 +217,8 @@ model_list:
             "--bind",
             &address.to_string(),
         ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to execute binary");
 
@@ -233,9 +235,16 @@ model_list:
         )
         .unwrap();
     active.write_all(&body[..8]).unwrap();
-    // Let the accept loop hand this socket to a worker before signaling; the
-    // worker is then blocked buffering an already accepted application request.
-    thread::sleep(Duration::from_millis(50));
+    // A later health request cannot be accepted until the active connection
+    // has been handed to its worker, giving this process-level signal test a
+    // synchronization point instead of relying on scheduler timing.
+    let mut health = TcpStream::connect(address).expect("connect health request");
+    health
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut health_response = String::new();
+    health.read_to_string(&mut health_response).unwrap();
+    assert!(health_response.starts_with("HTTP/1.1 200"));
     unsafe {
         extern "C" {
             fn kill(process: i32, signal: i32) -> i32;

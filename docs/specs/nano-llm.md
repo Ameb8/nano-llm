@@ -1002,6 +1002,15 @@ releases the generation permit, and performs no route lookup or provider work.
 Canonical validation then begins; `overall_timeout` starts only after parsing
 and canonical validation both succeed.
 
+The internal plain-HTTP listener applies a fixed 30-second deadline to complete
+the request header, and a fixed 30-second deadline to a blocked downstream
+response write. These are transport resource guards, not CLI or configuration
+settings. It bounds concurrently active connection workers and reaps finished
+workers during normal acceptance; a connection beyond that internal bound is
+closed rather than queued. Header admission (authentication, route/method
+handling, media type, and chat capacity) is completed before body ingestion so
+a withheld body cannot retain work that has already been rejected.
+
 The process also enforces `general_settings.max_in_flight`, default 64, with a
 single semaphore constructed only from the load-time validated value. It is
 applied only to `POST /v1/chat/completions` and acquired before buffering the

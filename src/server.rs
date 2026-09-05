@@ -20,6 +20,12 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+// These are transport safeguards, not public configuration: a peer that does
+// not complete its headers or consume a response may occupy one bounded worker
+// only for this long.
+const SOCKET_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONNECTION_WORKERS: usize = 128;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 type RawHeaders = Vec<(String, Vec<u8>)>;
 type ParsedHttpHead = (String, String, RawHeaders, usize);
@@ -77,10 +83,12 @@ fn run_listener(
     let listener = TcpListener::bind(bind)?;
     listener.set_nonblocking(true)?;
     let mut workers = Vec::new();
+    let active_connections = Arc::new(AtomicUsize::new(0));
 
     while !(shutdown.requested()
         || (observe_signals && TERMINATION_REQUESTED.load(Ordering::Acquire)))
     {
+        reap_workers(&mut workers);
         match listener.accept() {
             Ok((stream, _peer)) => {
                 // A signal may have arrived while accept was waiting. Do not
@@ -91,8 +99,18 @@ fn run_listener(
                     drop(stream);
                     break;
                 }
+                if !reserve_connection_slot(&active_connections) {
+                    // Keep the listener bounded under connection churn.  This
+                    // is deliberately a close rather than an unbounded queue.
+                    drop(stream);
+                    continue;
+                }
                 let application = application.clone();
-                workers.push(thread::spawn(move || serve_connection(stream, application)));
+                let active_connections = active_connections.clone();
+                workers.push(thread::spawn(move || {
+                    let _slot = ConnectionSlot(active_connections);
+                    serve_connection(stream, application)
+                }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -110,26 +128,103 @@ fn run_listener(
     Ok(())
 }
 
-fn serve_connection(mut stream: TcpStream, application: Application) {
-    let Ok(request) = read_http_request(&mut stream) else {
-        return;
-    };
-    if let Some(result) = application.begin_socket_stream(&request) {
-        match result {
-            Ok(delivery) => {
-                delivery.write_to(&mut stream);
-            }
-            Err(response) => {
-                let _ = write_http_response(&mut stream, &response);
-            }
+fn reap_workers(workers: &mut Vec<thread::JoinHandle<()>>) {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].is_finished() {
+            let worker = workers.swap_remove(index);
+            let _ = worker.join();
+        } else {
+            index += 1;
         }
-        return;
     }
-    let response = application.handle(&request);
-    let _ = write_http_response(&mut stream, &response);
 }
 
-fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+fn reserve_connection_slot(active: &AtomicUsize) -> bool {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_CONNECTION_WORKERS {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn serve_connection(mut stream: TcpStream, application: Application) {
+    let Ok((mut request, content_length, initial_body)) = read_http_head(&mut stream) else {
+        return;
+    };
+    match application.socket_admit(&request) {
+        SocketAdmission::Respond(response) => {
+            let _ = write_http_response(&mut stream, &response);
+        }
+        SocketAdmission::Chat {
+            permit,
+            request_id,
+            started,
+        } => {
+            let cancellation = DownstreamCancellation::default();
+            let _watcher = DisconnectWatcher::start(&stream, cancellation.clone());
+            request = request.with_downstream_cancellation(cancellation);
+            match read_http_body(&mut stream, content_length, initial_body) {
+                Ok(body) => {
+                    request.body = body;
+                    match application
+                        .handle_admitted_socket_chat(&request, permit, request_id, started)
+                    {
+                        SocketChatResult::Stream(delivery) => delivery.write_to(&mut stream),
+                        SocketChatResult::Response(response) => {
+                            let _ = write_http_response(&mut stream, &response);
+                        }
+                    }
+                }
+                Err(kind) => {
+                    drop(permit);
+                    let response = with_request_id(
+                        error_response(GatewayError::new(
+                            kind,
+                            if kind == GatewayErrorKind::RequestBodyTimeout {
+                                "Request body timed out"
+                            } else {
+                                "Request body is too large"
+                            },
+                            None,
+                        )),
+                        request_id,
+                    );
+                    emit_completion(
+                        &response,
+                        gateway_outcome(kind),
+                        started,
+                        &CompletionContext::default(),
+                    );
+                    let _ = write_http_response(&mut stream, &response);
+                }
+            }
+        }
+    }
+}
+
+/// Read only the HTTP head.  Header admission intentionally precedes body
+/// ingestion so rejected requests never wait for an attacker-controlled body.
+fn read_http_head(stream: &mut TcpStream) -> io::Result<(HttpRequest, usize, Vec<u8>)> {
+    stream.set_read_timeout(Some(SOCKET_HEADER_TIMEOUT))?;
     let mut bytes = Vec::new();
     let header_end = loop {
         if bytes.len() > MAX_HTTP_HEADER_BYTES {
@@ -153,30 +248,52 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     };
 
     let (method, path, headers, content_length) = parse_http_head(&bytes[..header_end])?;
-    if content_length > MAX_REQUEST_BODY_BYTES + 1 {
-        // The application seam owns the canonical 413 envelope. It needs only
-        // one byte beyond the cap to make that deterministic.
-        return Ok(HttpRequest::new(method, path)
-            .with_headers(headers)
-            .with_body(vec![0; MAX_REQUEST_BODY_BYTES + 1]));
+    Ok((
+        HttpRequest::new(method, path).with_headers(headers),
+        content_length,
+        bytes[header_end..].to_vec(),
+    ))
+}
+
+fn read_http_body(
+    stream: &mut TcpStream,
+    content_length: usize,
+    mut body: Vec<u8>,
+) -> Result<Vec<u8>, GatewayErrorKind> {
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        return Err(GatewayErrorKind::RequestTooLarge);
     }
-    let mut body = bytes[header_end..].to_vec();
+    body.truncate(content_length);
+    let deadline = Instant::now() + REQUEST_BODY_TIMEOUT;
     while body.len() < content_length {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(GatewayErrorKind::RequestBodyTimeout);
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| GatewayErrorKind::RequestBodyTimeout)?;
         let mut chunk = [0_u8; 4096];
-        let read = stream.read(&mut chunk)?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(GatewayErrorKind::RequestBodyTimeout)
+            }
+            Err(_) => return Err(GatewayErrorKind::RequestBodyTimeout),
+        };
         if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete request body",
-            ));
+            return Err(GatewayErrorKind::RequestBodyTimeout);
         }
         let needed = content_length - body.len();
         body.extend_from_slice(&chunk[..read.min(needed)]);
     }
-    body.truncate(content_length);
-    Ok(HttpRequest::new(method, path)
-        .with_headers(headers)
-        .with_body(body))
+    Ok(body)
 }
 
 fn parse_http_head(bytes: &[u8]) -> io::Result<ParsedHttpHead> {
@@ -266,6 +383,7 @@ fn parse_http_head(bytes: &[u8]) -> io::Result<ParsedHttpHead> {
 }
 
 fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::Result<()> {
+    stream.set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))?;
     let reason = match response.status {
         200 => "OK",
         400 => "Bad Request",
@@ -295,6 +413,7 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::R
 /// this deliberately has no Content-Length: every following write is observed
 /// by the peer as the selected canonical stream makes progress.
 fn write_sse_head(stream: &mut TcpStream, response: &HttpResponse) -> io::Result<()> {
+    stream.set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))?;
     write!(stream, "HTTP/1.1 {} OK\r\n", response.status)?;
     for (name, value) in &response.headers {
         write!(stream, "{name}: {value}\r\n")?;
@@ -353,6 +472,60 @@ pub struct DownstreamCancellation(Arc<std::sync::atomic::AtomicBool>);
 impl PartialEq for DownstreamCancellation {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// A socket-level disconnect observer.  Router cancellation is useful only
+/// when it reflects the peer, so the listener owns this short-lived watcher
+/// rather than relying on tests to toggle a token.  It is joined before the
+/// connection worker exits and never becomes detached background work.
+struct DisconnectWatcher {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl DisconnectWatcher {
+    fn start(stream: &TcpStream, cancellation: DownstreamCancellation) -> Self {
+        let Ok(probe) = stream.try_clone() else {
+            return Self {
+                stop: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                worker: None,
+            };
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            let _ = probe.set_nonblocking(true);
+            let mut byte = [0_u8; 1];
+            while !watcher_stop.load(Ordering::Acquire) {
+                match probe.peek(&mut byte) {
+                    Ok(0) => {
+                        cancellation.cancel();
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        cancellation.cancel();
+                        return;
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for DisconnectWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -645,6 +818,20 @@ struct ChatHandling {
     attempts: Vec<AttemptRecord>,
 }
 
+enum SocketAdmission {
+    Respond(HttpResponse),
+    Chat {
+        permit: GenerationPermit,
+        request_id: String,
+        started: Instant,
+    },
+}
+
+enum SocketChatResult {
+    Response(HttpResponse),
+    Stream(Box<SocketStreamDelivery>),
+}
+
 impl ChatHandling {
     fn early(kind: GatewayErrorKind, message: &'static str) -> Self {
         Self::with_context(
@@ -756,6 +943,24 @@ fn emit_completion(
     );
 }
 
+fn socket_early_response(
+    request_id: &str,
+    started: Instant,
+    response: HttpResponse,
+) -> HttpResponse {
+    let response = with_request_id(response, request_id.to_owned());
+    let outcome = match response.status {
+        401 => "authentication_failed",
+        415 => "unsupported_media_type",
+        503 => "capacity_exhausted",
+        _ => "invalid_request",
+    };
+    let span = tracing::info_span!("request", request_id = %request_id);
+    let _guard = span.enter();
+    emit_completion(&response, outcome, started, &CompletionContext::default());
+    response
+}
+
 fn emit_attempt_failures(attempts: &[AttemptRecord]) {
     for attempt in attempts {
         if let AttemptOutcome::Failed {
@@ -820,6 +1025,100 @@ pub fn app_with_provider_factory_and_clock(
 }
 
 impl Application {
+    /// Apply every header-only rule before allowing the transport to ingest an
+    /// application body.  In particular, capacity is deliberately acquired
+    /// after authentication and media-type validation and before buffering.
+    fn socket_admit(&self, request: &HttpRequest) -> SocketAdmission {
+        if request.path != "/v1/chat/completions" || request.method != "POST" {
+            return SocketAdmission::Respond(self.handle(request));
+        }
+        let request_id = select_request_id(request);
+        let started = Instant::now();
+        if !self.is_authenticated(request) {
+            return SocketAdmission::Respond(socket_early_response(
+                &request_id,
+                started,
+                error_response(GatewayError::new(
+                    GatewayErrorKind::AuthenticationFailed,
+                    "Authentication failed",
+                    None,
+                )),
+            ));
+        }
+        if !valid_json_content_type(request) {
+            return SocketAdmission::Respond(socket_early_response(
+                &request_id,
+                started,
+                error_response(GatewayError::new(
+                    GatewayErrorKind::UnsupportedMediaType,
+                    "Unsupported media type",
+                    None,
+                )),
+            ));
+        }
+        let Some(permit) = self.generation_capacity.try_acquire() else {
+            return SocketAdmission::Respond(socket_early_response(
+                &request_id,
+                started,
+                error_response(GatewayError::new(
+                    GatewayErrorKind::CapacityExhausted,
+                    "Generation capacity exhausted",
+                    None,
+                )),
+            ));
+        };
+        SocketAdmission::Chat {
+            permit,
+            request_id,
+            started,
+        }
+    }
+
+    fn handle_admitted_socket_chat(
+        &self,
+        request: &HttpRequest,
+        permit: GenerationPermit,
+        request_id: String,
+        started: Instant,
+    ) -> SocketChatResult {
+        if self.is_socket_stream_candidate(request) {
+            let result = self
+                .begin_socket_stream_with_permit(request, permit, request_id.clone(), started)
+                .expect("stream candidate was validated before delivery");
+            return match result {
+                Ok(delivery) => SocketChatResult::Stream(Box::new(delivery)),
+                Err(response) => SocketChatResult::Response(response),
+            };
+        }
+        let handled = self.chat_response_with_permit(request, permit);
+        emit_attempt_failures(&handled.attempts);
+        if handled.response.status >= 500 {
+            tracing::warn!(event = "request_failed", outcome = %handled.outcome, status = handled.response.status);
+        }
+        let response = with_request_id(handled.response, request_id);
+        emit_completion(&response, handled.outcome, started, &handled.context);
+        SocketChatResult::Response(response)
+    }
+
+    fn is_socket_stream_candidate(&self, request: &HttpRequest) -> bool {
+        let Ok(body) = buffer_body(request) else {
+            return false;
+        };
+        let Ok(fields) = decode_json_object(&body) else {
+            return false;
+        };
+        let Ok(model) = requested_model(&fields) else {
+            return false;
+        };
+        let Some(route) = self.config.get_route(&model) else {
+            return false;
+        };
+        let Ok(canonical) = decode_chat_request_fields(fields) else {
+            return false;
+        };
+        canonical.stream && canonical.validate_for_route(route).is_ok()
+    }
+
     /// Select an ID before any route or authentication processing, then dispatch.
     pub fn handle(&self, request: &HttpRequest) -> HttpResponse {
         let request_id = select_request_id(request);
@@ -905,15 +1204,14 @@ impl Application {
     /// validation errors) on the long-standing materialized response seam.
     /// A selected stream is intentionally returned, not consumed here, so no
     /// downstream bytes exist until the listener has its first chunk.
-    fn begin_socket_stream(
+    fn begin_socket_stream_with_permit(
         &self,
         request: &HttpRequest,
+        permit: GenerationPermit,
+        request_id: String,
+        started: Instant,
     ) -> Option<Result<SocketStreamDelivery, HttpResponse>> {
-        if request.path != "/v1/chat/completions"
-            || request.method != "POST"
-            || !self.is_authenticated(request)
-            || !valid_json_content_type(request)
-        {
+        if request.path != "/v1/chat/completions" || request.method != "POST" {
             return None;
         }
         // Decode before taking the special delivery path.  Invalid requests
@@ -927,20 +1225,8 @@ impl Application {
             return None;
         }
 
-        let request_id = select_request_id(request);
         let request_span = tracing::info_span!("request", request_id = %request_id);
         let _request_guard = request_span.enter();
-        let started = Instant::now();
-        let Some(permit) = self.generation_capacity.try_acquire() else {
-            return Some(Err(with_request_id(
-                error_response(GatewayError::new(
-                    GatewayErrorKind::CapacityExhausted,
-                    "Generation capacity exhausted",
-                    None,
-                )),
-                request_id,
-            )));
-        };
         match self.dispatch_stream_route(route, &canonical, &request.cancellation) {
             Ok(dispatch) => {
                 let context = CompletionContext::from_diagnostics(&dispatch.diagnostics);
@@ -1021,6 +1307,14 @@ impl Application {
             );
         };
 
+        self.chat_response_with_permit(request, _permit)
+    }
+
+    fn chat_response_with_permit(
+        &self,
+        request: &HttpRequest,
+        _permit: GenerationPermit,
+    ) -> ChatHandling {
         let body = match buffer_body(request) {
             Ok(body) => body,
             Err(kind) => {

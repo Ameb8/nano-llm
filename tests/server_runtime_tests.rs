@@ -36,6 +36,15 @@ fn request(address: SocketAddr, request: &[u8]) -> String {
     response
 }
 
+fn response_soon(stream: &mut TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
 struct BlockingProvider {
     started: Arc<AtomicBool>,
     release: Arc<AtomicBool>,
@@ -294,6 +303,77 @@ general_settings:
     let mut tail = String::new();
     client.read_to_string(&mut tail).unwrap();
     assert!(tail.contains("data: [DONE]\n\n"));
+    shutdown.request();
+    server.join().unwrap();
+}
+
+#[test]
+fn header_admission_rejects_withheld_bodies_before_they_are_read() {
+    let yaml = r#"
+model_list:
+  - model_name: alpha
+    litellm_params:
+      model: openai_compatible/test
+      api_base: http://localhost:8000/v1
+general_settings:
+  max_in_flight: 1
+"#;
+    let config =
+        build_runtime_config(parse_yaml_str(yaml).unwrap(), true, &HashMap::new()).unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let factory: Arc<ProviderFactory> = {
+        let started = started.clone();
+        let release = release.clone();
+        Arc::new(move |_| {
+            Box::new(BlockingProvider {
+                started: started.clone(),
+                release: release.clone(),
+            })
+        })
+    };
+    let address = unused_loopback_addr();
+    let shutdown = Shutdown::default();
+    let server_shutdown = shutdown.clone();
+    let server = thread::spawn(move || {
+        serve_until(
+            app_with_provider_factory(config, true, factory),
+            address,
+            server_shutdown,
+        )
+        .unwrap()
+    });
+
+    let mut active = connect(address);
+    active.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"model\":\"alpha\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !started.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "initial request did not start");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut saturated = connect(address);
+    saturated.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n").unwrap();
+    assert!(response_soon(&mut saturated).starts_with("HTTP/1.1 503"));
+
+    let mut unsupported = connect(address);
+    unsupported.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\nContent-Length: 64\r\n\r\n").unwrap();
+    assert!(response_soon(&mut unsupported).starts_with("HTTP/1.1 415"));
+
+    let mut missing = connect(address);
+    missing
+        .write_all(
+            b"POST /v1/not-a-route HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n",
+        )
+        .unwrap();
+    assert!(response_soon(&mut missing).starts_with("HTTP/1.1 404"));
+
+    release.store(true, Ordering::Release);
+    let _ = response_soon(&mut active);
+    let mut oversized = connect(address);
+    oversized.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1048577\r\n\r\n").unwrap();
+    assert!(response_soon(&mut oversized).starts_with("HTTP/1.1 413"));
+
     shutdown.request();
     server.join().unwrap();
 }

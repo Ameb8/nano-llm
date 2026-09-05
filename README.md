@@ -80,6 +80,34 @@ nano-llm --config <path> [--bind <address>] [--no-auth] [--validate]
 
 `--no-auth` is intended only for local development and is rejected on a non-loopback bind address. In that mode, `general_settings` may be omitted. The listener serves plain HTTP; use a reverse proxy, tunnel, or load balancer to terminate TLS for remote deployments.
 
+## Static Linux artifacts and container image
+
+Release artifacts are statically linked Linux binaries for `x86_64` and
+`aarch64`. Build and inspect both locally with Docker Buildx:
+
+```bash
+task release-linux
+```
+
+The resulting binaries are written to `dist/x86_64/nano-llm` and
+`dist/aarch64/nano-llm`. The bundled-root transport policy verifies outbound
+provider HTTPS without host CA files and never shells out to a provider CLI.
+
+Build the runtime image with `task image`. It is `FROM scratch` and contains
+only `/nano-llm`; mount YAML at `/etc/nano-llm/config.yaml` and provide the
+environment variables referenced by its secret fields:
+
+```bash
+docker run --rm -p 4000:4000 \
+  -v "$PWD/config.yaml:/etc/nano-llm/config.yaml:ro" \
+  -e LITELLM_MASTER_KEY -e OPENAI_API_KEY nano-llm:local
+```
+
+There is deliberately no image `HEALTHCHECK`: a scratch image has no shell or
+HTTP client. Probe its plain `http://…/health` listener externally. nano-llm
+does not provide inbound TLS, certificates, or ACME; outbound provider HTTPS
+uses bundled trust roots.
+
 ## Making a request
 
 When authentication is enabled, `/v1/*` endpoints require the configured `master_key` as a bearer token. `/health` is always unauthenticated.

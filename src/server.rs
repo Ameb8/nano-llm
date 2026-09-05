@@ -21,6 +21,8 @@ const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+type RawHeaders = Vec<(String, Vec<u8>)>;
+type ParsedHttpHead = (String, String, RawHeaders, usize);
 
 // Signal handlers are intentionally limited to setting this lock-free flag.
 // In particular, they do not close sockets or join worker threads; those are
@@ -76,8 +78,8 @@ fn run_listener(
     listener.set_nonblocking(true)?;
     let mut workers = Vec::new();
 
-    while !shutdown.requested()
-        && !(observe_signals && TERMINATION_REQUESTED.load(Ordering::Acquire))
+    while !(shutdown.requested()
+        || (observe_signals && TERMINATION_REQUESTED.load(Ordering::Acquire)))
     {
         match listener.accept() {
             Ok((stream, _peer)) => {
@@ -166,7 +168,7 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
         .with_body(body))
 }
 
-fn parse_http_head(bytes: &[u8]) -> io::Result<(String, String, Vec<(String, Vec<u8>)>, usize)> {
+fn parse_http_head(bytes: &[u8]) -> io::Result<ParsedHttpHead> {
     let Some(request_line_end) = bytes.windows(2).position(|window| window == b"\r\n") else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -280,7 +282,7 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::R
 
 #[cfg(unix)]
 fn install_termination_handlers() -> io::Result<()> {
-    type SignalHandler = usize;
+    type SignalHandler = extern "C" fn(std::os::raw::c_int);
     unsafe extern "C" {
         fn signal(signal: std::os::raw::c_int, handler: SignalHandler) -> SignalHandler;
     }
@@ -291,8 +293,8 @@ fn install_termination_handlers() -> io::Result<()> {
     // performs a lock-free atomic store. Failure is reported rather than
     // silently serving without graceful termination behavior.
     unsafe {
-        if signal(2, request_shutdown as SignalHandler) == usize::MAX
-            || signal(15, request_shutdown as SignalHandler) == usize::MAX
+        if signal(2, request_shutdown) as usize == usize::MAX
+            || signal(15, request_shutdown) as usize == usize::MAX
         {
             return Err(io::Error::last_os_error());
         }

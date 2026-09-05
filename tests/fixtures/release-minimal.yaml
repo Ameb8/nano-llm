@@ -1,0 +1,5 @@
+model_list:
+  - model_name: qualification
+    litellm_params:
+      model: openai_compatible/local-test
+      api_base: http://127.0.0.1:9/v1

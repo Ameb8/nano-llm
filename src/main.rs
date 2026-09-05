@@ -4,6 +4,11 @@ use std::fs;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(std::io::stdout)
+        .init();
     let cli = match Cli::parse_and_validate(std::env::args_os()) {
         Ok(cli) => cli,
         Err(CliError::Clap(err)) => {

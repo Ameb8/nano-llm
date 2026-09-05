@@ -7,6 +7,7 @@ use crate::request::{
 };
 use crate::response::{ChatChunk, ChatResponse, ToolCall};
 use std::fmt::Write;
+use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -296,6 +297,165 @@ pub struct Application {
     clock: Arc<dyn MonotonicClock>,
 }
 
+/// The only values allowed to cross from request processing into logs.
+/// Bodies, headers, credentials, URLs, and provider messages are deliberately
+/// absent from this type.
+#[derive(Default)]
+struct CompletionContext {
+    requested_model: Option<String>,
+    selected_provider: Option<ProviderKind>,
+    selected_model: Option<String>,
+    attempt_count: Option<usize>,
+}
+
+impl CompletionContext {
+    fn from_diagnostics(diagnostics: &RouteDiagnostics) -> Self {
+        Self {
+            requested_model: Some(diagnostics.requested_model.clone()),
+            selected_provider: diagnostics.selected_provider,
+            selected_model: diagnostics.selected_model.clone(),
+            attempt_count: Some(diagnostics.attempt_count),
+        }
+    }
+}
+
+struct ChatHandling {
+    response: HttpResponse,
+    outcome: &'static str,
+    context: CompletionContext,
+    attempts: Vec<AttemptRecord>,
+}
+
+impl ChatHandling {
+    fn early(kind: GatewayErrorKind, message: &'static str) -> Self {
+        Self::with_context(
+            error_response(GatewayError::new(kind, message, None)),
+            gateway_outcome(kind),
+            CompletionContext::default(),
+            Vec::new(),
+        )
+    }
+
+    fn decode_error(error: DecodeError) -> Self {
+        let kind = decode_error_kind(&error);
+        Self::with_context(
+            decode_error_response(error),
+            gateway_outcome(kind),
+            CompletionContext::default(),
+            Vec::new(),
+        )
+    }
+
+    fn decode_error_with_context(error: DecodeError, context: CompletionContext) -> Self {
+        let kind = decode_error_kind(&error);
+        Self::with_context(
+            decode_error_response(error),
+            gateway_outcome(kind),
+            context,
+            Vec::new(),
+        )
+    }
+
+    fn with_diagnostics(
+        response: HttpResponse,
+        outcome: &'static str,
+        diagnostics: RouteDiagnostics,
+        attempts: Vec<AttemptRecord>,
+    ) -> Self {
+        Self::with_context(
+            response,
+            outcome,
+            CompletionContext::from_diagnostics(&diagnostics),
+            attempts,
+        )
+    }
+
+    fn with_context(
+        response: HttpResponse,
+        outcome: &'static str,
+        context: CompletionContext,
+        attempts: Vec<AttemptRecord>,
+    ) -> Self {
+        Self {
+            response,
+            outcome,
+            context,
+            attempts,
+        }
+    }
+}
+
+fn decode_error_kind(error: &DecodeError) -> GatewayErrorKind {
+    match error {
+        DecodeError::InvalidJson { .. } => GatewayErrorKind::InvalidJson,
+        DecodeError::Validation { .. } => GatewayErrorKind::InvalidRequest,
+    }
+}
+
+fn gateway_outcome(kind: GatewayErrorKind) -> &'static str {
+    match kind {
+        GatewayErrorKind::InvalidRequest => "invalid_request",
+        GatewayErrorKind::InvalidJson => "invalid_json",
+        GatewayErrorKind::AuthenticationFailed => "authentication_failed",
+        GatewayErrorKind::ModelNotFound => "model_not_found",
+        GatewayErrorKind::RouteNotFound => "route_not_found",
+        GatewayErrorKind::RequestBodyTimeout => "request_body_timeout",
+        GatewayErrorKind::RequestTooLarge => "request_too_large",
+        GatewayErrorKind::UnsupportedMediaType => "unsupported_media_type",
+        GatewayErrorKind::UpstreamExhausted => "upstream_exhausted",
+        GatewayErrorKind::CapacityExhausted => "capacity_exhausted",
+        GatewayErrorKind::OverallTimeout => "overall_timeout",
+    }
+}
+
+struct Nullable<'a, T>(&'a Option<T>);
+
+impl<T: Display> Display for Nullable<'_, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(value) => value.fmt(formatter),
+            None => formatter.write_str("null"),
+        }
+    }
+}
+
+fn emit_completion(
+    response: &HttpResponse,
+    outcome: &str,
+    started: Instant,
+    context: &CompletionContext,
+) {
+    tracing::info!(
+        event = "request_completed",
+        outcome = %outcome,
+        status = response.status,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        requested_model = %Nullable(&context.requested_model),
+        selected_provider = %Nullable(&context.selected_provider),
+        selected_model = %Nullable(&context.selected_model),
+        attempt_count = %Nullable(&context.attempt_count),
+    );
+}
+
+fn emit_attempt_failures(attempts: &[AttemptRecord]) {
+    for attempt in attempts {
+        if let AttemptOutcome::Failed {
+            kind,
+            upstream_status,
+        } = attempt.outcome
+        {
+            tracing::debug!(
+                event = "attempt_failed",
+                route_index = attempt.route_index,
+                provider = %attempt.provider,
+                target_model = %attempt.target_model,
+                error_kind = ?kind,
+                upstream_status = %Nullable(&upstream_status),
+            );
+        }
+    }
+}
+
 /// Constructs one target-bound provider after routing has selected its target.
 /// The factory is an application seam: routing sees only canonical requests and
 /// providers never see route selection or inbound HTTP details.
@@ -344,24 +504,79 @@ impl Application {
     /// Select an ID before any route or authentication processing, then dispatch.
     pub fn handle(&self, request: &HttpRequest) -> HttpResponse {
         let request_id = select_request_id(request);
+        let request_span = tracing::info_span!("request", request_id = %request_id);
+        let _request_guard = request_span.enter();
+        let started = Instant::now();
         let response = if request.path == "/health" && request.method == "GET" {
-            json_response(200, "{\"status\":\"ok\"}".to_owned())
+            let response = json_response(200, "{\"status\":\"ok\"}".to_owned());
+            emit_completion(
+                &response,
+                "completed",
+                started,
+                &CompletionContext::default(),
+            );
+            response
         } else if request.path.starts_with("/v1/") {
             if !self.is_authenticated(request) {
-                error_response(GatewayError::new(
+                let response = error_response(GatewayError::new(
                     GatewayErrorKind::AuthenticationFailed,
                     "Authentication failed",
                     None,
-                ))
+                ));
+                emit_completion(
+                    &response,
+                    "authentication_failed",
+                    started,
+                    &CompletionContext::default(),
+                );
+                response
             } else if request.path == "/v1/models" && request.method == "GET" {
-                self.models_response()
+                let response = self.models_response();
+                emit_completion(
+                    &response,
+                    "completed",
+                    started,
+                    &CompletionContext::default(),
+                );
+                response
             } else if request.path == "/v1/chat/completions" && request.method == "POST" {
-                self.chat_response(request)
+                let handled = self.chat_response(request);
+                emit_attempt_failures(&handled.attempts);
+                if handled.response.status >= 500
+                    || handled.outcome == "upstream_failed_after_commit"
+                {
+                    tracing::warn!(
+                        event = "request_failed",
+                        outcome = %handled.outcome,
+                        status = handled.response.status
+                    );
+                }
+                emit_completion(
+                    &handled.response,
+                    handled.outcome,
+                    started,
+                    &handled.context,
+                );
+                handled.response
             } else {
-                route_not_found()
+                let response = route_not_found();
+                emit_completion(
+                    &response,
+                    "route_not_found",
+                    started,
+                    &CompletionContext::default(),
+                );
+                response
             }
         } else {
-            route_not_found()
+            let response = route_not_found();
+            emit_completion(
+                &response,
+                "route_not_found",
+                started,
+                &CompletionContext::default(),
+            );
+            response
         };
         with_request_id(response, request_id)
     }
@@ -377,72 +592,100 @@ impl Application {
         values.len() == 1 && exact_bearer_matches(values[0], master_key.expose_secret().as_bytes())
     }
 
-    fn chat_response(&self, request: &HttpRequest) -> HttpResponse {
+    fn chat_response(&self, request: &HttpRequest) -> ChatHandling {
         if !valid_json_content_type(request) {
-            return error_response(GatewayError::new(
+            return ChatHandling::early(
                 GatewayErrorKind::UnsupportedMediaType,
                 "Unsupported media type",
-                None,
-            ));
+            );
         }
 
         let Some(_permit) = self.generation_capacity.try_acquire() else {
-            return error_response(GatewayError::new(
+            return ChatHandling::early(
                 GatewayErrorKind::CapacityExhausted,
                 "Generation capacity exhausted",
-                None,
-            ));
+            );
         };
 
         let body = match buffer_body(request) {
             Ok(body) => body,
             Err(kind) => {
-                return error_response(GatewayError::new(
+                return ChatHandling::early(
                     kind,
                     match kind {
                         GatewayErrorKind::RequestBodyTimeout => "Request body timed out",
                         GatewayErrorKind::RequestTooLarge => "Request body is too large",
                         _ => unreachable!("body buffering returns only body-limit errors"),
                     },
-                    None,
-                ))
+                )
             }
         };
         let fields = match decode_json_object(&body) {
             Ok(fields) => fields,
-            Err(error) => return decode_error_response(error),
+            Err(error) => return ChatHandling::decode_error(error),
         };
         let model = match requested_model(&fields) {
             Ok(model) => model,
-            Err(error) => return decode_error_response(error),
+            Err(error) => return ChatHandling::decode_error(error),
+        };
+        let requested_context = CompletionContext {
+            requested_model: Some(model.clone()),
+            ..CompletionContext::default()
         };
         let Some(route) = self.config.get_route(&model) else {
-            return error_response(GatewayError::new(
-                GatewayErrorKind::ModelNotFound,
-                "Model not found",
-                Some("model".into()),
-            ));
+            return ChatHandling::with_context(
+                error_response(GatewayError::new(
+                    GatewayErrorKind::ModelNotFound,
+                    "Model not found",
+                    Some("model".into()),
+                )),
+                "model_not_found",
+                requested_context,
+                Vec::new(),
+            );
         };
         let canonical = match decode_chat_request_fields(fields) {
             Ok(request) => request,
-            Err(error) => return decode_error_response(error),
+            Err(error) => return ChatHandling::decode_error_with_context(error, requested_context),
         };
         if let Err(error) = canonical.validate_for_route(route) {
-            return decode_error_response(error);
+            return ChatHandling::decode_error_with_context(error, requested_context);
         }
         if canonical.stream {
             return match self.dispatch_stream_route(route, &canonical, &request.cancellation) {
-                Ok(dispatch) => sse_response(dispatch),
-                Err(exhausted) if exhausted.overall_timeout => error_response(GatewayError::new(
-                    GatewayErrorKind::OverallTimeout,
-                    "Overall request timed out",
-                    None,
-                )),
-                Err(_) => error_response(GatewayError::new(
-                    GatewayErrorKind::UpstreamExhausted,
-                    "All configured upstream targets failed",
-                    None,
-                )),
+                Ok(dispatch) => {
+                    let context = CompletionContext::from_diagnostics(&dispatch.diagnostics);
+                    let attempts = dispatch.attempts.clone();
+                    let (response, outcome) = sse_response(dispatch);
+                    ChatHandling::with_context(response, outcome.as_str(), context, attempts)
+                }
+                Err(exhausted) if exhausted.overall_timeout => ChatHandling::with_diagnostics(
+                    error_response(GatewayError::new(
+                        GatewayErrorKind::OverallTimeout,
+                        "Overall request timed out",
+                        None,
+                    )),
+                    "overall_timeout",
+                    exhausted.diagnostics,
+                    exhausted.attempts,
+                ),
+                Err(exhausted) => {
+                    let outcome = if exhausted.cancelled {
+                        "client_disconnected"
+                    } else {
+                        "upstream_exhausted"
+                    };
+                    ChatHandling::with_diagnostics(
+                        error_response(GatewayError::new(
+                            GatewayErrorKind::UpstreamExhausted,
+                            "All configured upstream targets failed",
+                            None,
+                        )),
+                        outcome,
+                        exhausted.diagnostics,
+                        exhausted.attempts,
+                    )
+                }
             };
         }
 
@@ -453,17 +696,32 @@ impl Application {
         // canonical route validation: none of that inbound work consumes the
         // fallback-chain budget.
         match self.dispatch_route(route, &canonical, &request.cancellation) {
-            Ok(dispatch) => json_response(200, serialize_chat_response(&dispatch.response)),
-            Err(exhausted) if exhausted.overall_timeout => error_response(GatewayError::new(
-                GatewayErrorKind::OverallTimeout,
-                "Overall request timed out",
-                None,
-            )),
-            Err(_) => error_response(GatewayError::new(
-                GatewayErrorKind::UpstreamExhausted,
-                "All configured upstream targets failed",
-                None,
-            )),
+            Ok(dispatch) => ChatHandling::with_diagnostics(
+                json_response(200, serialize_chat_response(&dispatch.response)),
+                "completed",
+                dispatch.diagnostics,
+                dispatch.attempts,
+            ),
+            Err(exhausted) if exhausted.overall_timeout => ChatHandling::with_diagnostics(
+                error_response(GatewayError::new(
+                    GatewayErrorKind::OverallTimeout,
+                    "Overall request timed out",
+                    None,
+                )),
+                "overall_timeout",
+                exhausted.diagnostics,
+                exhausted.attempts,
+            ),
+            Err(exhausted) => ChatHandling::with_diagnostics(
+                error_response(GatewayError::new(
+                    GatewayErrorKind::UpstreamExhausted,
+                    "All configured upstream targets failed",
+                    None,
+                )),
+                "upstream_exhausted",
+                exhausted.diagnostics,
+                exhausted.attempts,
+            ),
         }
     }
 
@@ -1093,7 +1351,24 @@ fn json_response(status: u16, body: String) -> HttpResponse {
 /// SSE headers cannot be observed for a target that later proves invalid
 /// before its first chunk. A real network adapter may write the same events
 /// incrementally after this commitment point.
-fn sse_response(mut dispatch: StreamRouteDispatch) -> HttpResponse {
+#[derive(Clone, Copy)]
+enum StreamCompletionOutcome {
+    Completed,
+    ClientDisconnected,
+    UpstreamFailedAfterCommit,
+}
+
+impl StreamCompletionOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::ClientDisconnected => "client_disconnected",
+            Self::UpstreamFailedAfterCommit => "upstream_failed_after_commit",
+        }
+    }
+}
+
+fn sse_response(mut dispatch: StreamRouteDispatch) -> (HttpResponse, StreamCompletionOutcome) {
     let mut body = String::new();
     let expected = StreamMetadata::from(&dispatch.first_chunk);
     let mut state = match StreamSuccessState::first(&dispatch.first_chunk, dispatch.include_usage) {
@@ -1101,26 +1376,41 @@ fn sse_response(mut dispatch: StreamRouteDispatch) -> HttpResponse {
         // This should be unreachable for adapters, but the HTTP commitment
         // boundary must remain defensive if an implementation violates the
         // provider contract.
-        None => return empty_sse_response(),
+        None => {
+            return (
+                empty_sse_response(),
+                StreamCompletionOutcome::UpstreamFailedAfterCommit,
+            )
+        }
     };
     serialize_sse_chunk(&mut body, &dispatch.first_chunk);
     // The first chunk is the only event buffered before commitment. Emitting
     // it starts the post-commit idle interval; metadata and keepalives never
     // reach this boundary and therefore cannot reset it.
     let mut idle_deadline = dispatch.clock.now().saturating_add(dispatch.idle_timeout);
-    let mut completed = false;
+    let mut outcome = StreamCompletionOutcome::UpstreamFailedAfterCommit;
     loop {
-        if dispatch.cancellation.is_cancelled() || dispatch.clock.now() >= idle_deadline {
+        if dispatch.cancellation.is_cancelled() {
+            outcome = StreamCompletionOutcome::ClientDisconnected;
+            break;
+        }
+        if dispatch.clock.now() >= idle_deadline {
             break;
         }
         let item = dispatch.stream.next();
         // Decoding can itself consume the idle budget. A chunk obtained after
         // expiry is not emitted and cannot revive the stream.
-        if dispatch.cancellation.is_cancelled() || dispatch.clock.now() >= idle_deadline {
+        if dispatch.cancellation.is_cancelled() {
+            outcome = StreamCompletionOutcome::ClientDisconnected;
+            break;
+        }
+        if dispatch.clock.now() >= idle_deadline {
             break;
         }
         let Some(item) = item else {
-            completed = state.terminal;
+            if state.terminal {
+                outcome = StreamCompletionOutcome::Completed;
+            }
             break;
         };
         match item {
@@ -1140,10 +1430,10 @@ fn sse_response(mut dispatch: StreamRouteDispatch) -> HttpResponse {
             Err(_) => break,
         }
     }
-    if completed {
+    if matches!(outcome, StreamCompletionOutcome::Completed) {
         body.push_str("data: [DONE]\n\n");
     }
-    empty_sse_response_with_body(body)
+    (empty_sse_response_with_body(body), outcome)
 }
 
 fn empty_sse_response() -> HttpResponse {

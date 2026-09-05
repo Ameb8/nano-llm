@@ -7,6 +7,31 @@ use nano_llm::{
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogCapture {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
 
 fn target(suffix: &str) -> RuntimeTarget {
     RuntimeTarget {
@@ -88,7 +113,7 @@ impl Provider for RecordingProvider {
     }
 }
 
-fn chat(body: &'static [u8]) -> HttpRequest {
+fn chat(body: impl Into<Vec<u8>>) -> HttpRequest {
     HttpRequest::new("POST", "/v1/chat/completions")
         .with_header("content-type", "application/json")
         .with_body(body)
@@ -915,6 +940,73 @@ fn route_diagnostics_are_complete_and_cannot_contain_upstream_canaries() {
         br#"{"model":"public","messages":[{"role":"user","content":"upstream-body-and-credential-canary"}]}"#,
     ));
     assert!(!String::from_utf8(response.body).unwrap().contains(secret));
+}
+
+#[test]
+fn request_logs_are_complete_safe_and_include_safe_attempt_diagnostics() {
+    let canary = "body-credential-authorization-canary";
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(capture.clone())
+        .finish();
+    let response = tracing::subscriber::with_default(subscriber, || {
+        application(
+            vec![target("first"), target("fallback")],
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            true,
+        )
+        .handle(
+            &chat(
+                format!(
+                    r#"{{"model":"public","messages":[{{"role":"user","content":"{canary}"}}]}}"#
+                )
+                .into_bytes(),
+            )
+            .with_header("authorization", format!("Bearer {canary}"))
+            .with_header("x-request-id", "log-id"),
+        )
+    });
+    assert_eq!(response.status, 502);
+
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("request_completed").count(), 1);
+    assert!(logs.contains("request_id=log-id"));
+    assert!(logs.contains("outcome=upstream_exhausted"));
+    assert!(logs.contains("status=502"));
+    assert!(logs.contains("requested_model=public"));
+    assert!(logs.contains("selected_provider=openai"));
+    assert!(logs.contains("selected_model=openai/fallback"));
+    assert!(logs.contains("attempt_count=2"));
+    assert_eq!(logs.matches("attempt_failed").count(), 2);
+    assert!(!logs.contains(canary));
+
+    let health_capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_writer(health_capture.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        application(
+            vec![target("only")],
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        )
+        .handle(&HttpRequest::new("GET", "/health").with_header("x-request-id", "health-log"));
+    });
+    let health_logs = String::from_utf8(health_capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(health_logs.matches("request_completed").count(), 1);
+    assert!(health_logs.contains("requested_model=null"));
+    assert!(health_logs.contains("selected_provider=null"));
+    assert!(health_logs.contains("selected_model=null"));
+    assert!(health_logs.contains("attempt_count=null"));
 }
 
 #[derive(Default)]

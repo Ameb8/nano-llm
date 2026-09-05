@@ -41,6 +41,7 @@ jobs:
           target: artifact
           outputs: type=local,dest=dist/${{ matrix.architecture }}
       - run: scripts/verify-static-artifact.sh ${{ matrix.architecture }} dist/${{ matrix.architecture }}/nano-llm
+      - run: scripts/smoke-release-artifact.sh ${{ matrix.architecture }} dist/${{ matrix.architecture }}/nano-llm
       - uses: actions/upload-artifact@v4
         with:
           name: nano-llm-linux-${{ matrix.architecture }}
@@ -72,6 +73,10 @@ jobs:
           workdir=$(mktemp -d)
           trap 'docker rm -f nano-llm-smoke >/dev/null 2>&1 || true; rm -rf "$workdir"' EXIT
           printf '%s\n' 'model_list:' '  - model_name: local' '    litellm_params:' '      model: openai_compatible/test' '      api_base: http://127.0.0.1:1/v1' 'general_settings:' '  master_key: os.environ/NANO_LLM_MASTER_KEY' > "$workdir/config.yaml"
+          if docker run --rm -v "$workdir/config.yaml:/etc/nano-llm/config.yaml:ro" nano-llm:smoke >/dev/null 2>&1; then
+            echo 'image unexpectedly started without the required secret variable' >&2
+            exit 1
+          fi
           docker run -d --name nano-llm-smoke -p 127.0.0.1::4000 -v "$workdir/config.yaml:/etc/nano-llm/config.yaml:ro" -e NANO_LLM_MASTER_KEY=test-key nano-llm:smoke
           for _ in {1..50}; do curl -fsS "http://$(docker port nano-llm-smoke 4000)/health" && exit 0; sleep .1; done
           docker logs nano-llm-smoke

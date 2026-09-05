@@ -90,7 +90,10 @@ task release-linux
 ```
 
 The resulting binaries are written to `dist/x86_64/nano-llm` and
-`dist/aarch64/nano-llm`. The bundled-root transport policy verifies outbound
+`dist/aarch64/nano-llm`. `task release-linux` also starts each artifact (using
+native execution or `qemu-aarch64`/`qemu-aarch64-static`), checks health and
+models, sends a controlled chat request, and verifies incremental SSE plus
+canary non-disclosure. The bundled-root transport policy verifies outbound
 provider HTTPS without host CA files and never shells out to a provider CLI.
 
 Build the runtime image with `task image`. It is `FROM scratch` and contains
@@ -107,6 +110,15 @@ There is deliberately no image `HEALTHCHECK`: a scratch image has no shell or
 HTTP client. Probe its plain `http://…/health` listener externally. nano-llm
 does not provide inbound TLS, certificates, or ACME; outbound provider HTTPS
 uses bundled trust roots.
+
+To collect an idle-memory qualification sample from a release artifact, run:
+
+```bash
+scripts/measure-idle-rss.sh dist/x86_64/nano-llm tests/fixtures/release-minimal.yaml
+```
+
+The helper reports KiB and MiB. The documented target is **less than 20 MiB**,
+which is 20,480 KiB; it does not treat decimal MB as equivalent.
 
 ## Making a request
 

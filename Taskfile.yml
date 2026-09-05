@@ -45,12 +45,14 @@ tasks:
       - task: test
 
   release-linux:
-    desc: Export reproducible static Linux x86_64 and aarch64 binaries to dist/
+    desc: Export, inspect, and smoke-test static Linux x86_64 and aarch64 binaries
     cmds:
       - docker buildx build --platform linux/amd64 --target artifact --output type=local,dest=dist/x86_64 .
-      - scripts/verify-static-artifact.sh x86_64 dist/x86_64/nano-llm
+      - NANO_LLM_REQUIRE_EXECUTION=1 scripts/verify-static-artifact.sh x86_64 dist/x86_64/nano-llm
+      - scripts/smoke-release-artifact.sh x86_64 dist/x86_64/nano-llm
       - docker buildx build --platform linux/arm64 --target artifact --output type=local,dest=dist/aarch64 .
-      - scripts/verify-static-artifact.sh aarch64 dist/aarch64/nano-llm
+      - NANO_LLM_REQUIRE_EXECUTION=1 scripts/verify-static-artifact.sh aarch64 dist/aarch64/nano-llm
+      - scripts/smoke-release-artifact.sh aarch64 dist/aarch64/nano-llm
 
   image:
     desc: Build the minimal scratch runtime image for the host architecture

@@ -27,7 +27,22 @@ fn release_builds_both_static_linux_architectures() {
     assert!(dockerfile.contains("target-feature=+crt-static"));
     assert!(dockerfile.contains("cargo build --locked --release"));
     assert!(verifier.contains("static-pie linked"));
+    assert!(verifier.contains("Requesting program interpreter"));
+    assert!(verifier.contains("(NEEDED)"));
     assert!(verifier.contains("--help"));
+}
+
+#[test]
+fn release_smoke_exercises_the_public_gateway_surface_and_canary_scan() {
+    let smoke = repository_file("scripts/smoke-release-artifact.sh");
+    assert!(smoke.contains("/health"));
+    assert!(smoke.contains("/v1/models"));
+    assert!(smoke.contains("/v1/chat/completions"));
+    assert!(smoke.contains("data: [DONE]"));
+    assert!(smoke.contains("release-master-canary"));
+    assert!(smoke.contains("request-body-canary"));
+    assert!(smoke.contains("qemu-aarch64"));
+    assert!(smoke.contains("qemu-x86_64"));
 }
 
 #[test]

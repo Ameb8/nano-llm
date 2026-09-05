@@ -9,6 +9,8 @@ fi
 
 binary=$1
 config=$2
+test -x "$binary"
+test -f "$config"
 "$binary" --config "$config" --no-auth --bind 127.0.0.1:40138 >/dev/null 2>&1 &
 pid=$!
 cleanup() {
@@ -25,3 +27,7 @@ if [ -z "$rss_kib" ]; then
     exit 1
 fi
 printf 'idle_rss_kib=%s\n' "$rss_kib"
+# The release target is expressed as 20 MiB, not decimal MB: 20 MiB is
+# 20 * 1024 KiB.  Keep both values in the evidence output to avoid silently
+# changing units during qualification.
+awk -v rss_kib="$rss_kib" 'BEGIN { printf "idle_rss_mib=%.2f\nidle_rss_under_20_mib=%s\n", rss_kib / 1024, (rss_kib < 20 * 1024 ? "true" : "false") }'

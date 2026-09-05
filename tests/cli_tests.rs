@@ -1,5 +1,9 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn bin_path() -> &'static str {
     env!("CARGO_BIN_EXE_nano-llm")
@@ -17,6 +21,22 @@ fn write_temp_config(content: &str) -> std::path::PathBuf {
     dir.push(filename);
     fs::write(&dir, content).expect("failed to write temp config file");
     dir
+}
+
+fn unused_loopback_addr() -> SocketAddr {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.local_addr().unwrap()
+}
+
+fn wait_until_listening(address: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if TcpStream::connect(address).is_ok() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "server did not start listening");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -188,10 +208,52 @@ model_list:
 
     let config_path = write_temp_config(config_yaml);
 
-    let output = Command::new(bin_path())
-        .args(["--config", config_path.to_str().unwrap(), "--no-auth"])
-        .output()
+    let address = unused_loopback_addr();
+    let mut child = Command::new(bin_path())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--no-auth",
+            "--bind",
+            &address.to_string(),
+        ])
+        .spawn()
         .expect("failed to execute binary");
+
+    wait_until_listening(address);
+    let body = b"{\"model\":\"local\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}";
+    let mut active = TcpStream::connect(address).expect("connect active request");
+    active
+        .write_all(
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    active.write_all(&body[..8]).unwrap();
+    // Let the accept loop hand this socket to a worker before signaling; the
+    // worker is then blocked buffering an already accepted application request.
+    thread::sleep(Duration::from_millis(50));
+    unsafe {
+        extern "C" {
+            fn kill(process: i32, signal: i32) -> i32;
+        }
+        assert_eq!(kill(child.id() as i32, 15), 0, "SIGTERM must be delivered");
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "SIGTERM must retain the accepted in-flight request"
+    );
+    active.write_all(&body[8..]).unwrap();
+    let mut active_response = String::new();
+    active.read_to_string(&mut active_response).unwrap();
+    assert!(active_response.starts_with("HTTP/1.1 502"));
+    let output = child
+        .wait_with_output()
+        .expect("server should exit after SIGTERM");
 
     let _ = fs::remove_file(&config_path);
 
@@ -201,6 +263,40 @@ model_list:
         stderr.contains("WARNING: running with --no-auth; inbound authentication is disabled"),
         "stderr should contain loud warning when serving with --no-auth (got: {stderr})"
     );
+}
+
+#[test]
+fn test_cli_sigint_stops_the_listener() {
+    let config_path = write_temp_config(
+        r#"
+model_list:
+  - model_name: local
+    litellm_params:
+      model: openai_compatible/custom
+      api_base: http://localhost:8000/v1
+"#,
+    );
+    let address = unused_loopback_addr();
+    let mut child = Command::new(bin_path())
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--no-auth",
+            "--bind",
+            &address.to_string(),
+        ])
+        .spawn()
+        .expect("failed to execute binary");
+    wait_until_listening(address);
+    unsafe {
+        extern "C" {
+            fn kill(process: i32, signal: i32) -> i32;
+        }
+        assert_eq!(kill(child.id() as i32, 2), 0, "SIGINT must be delivered");
+    }
+    let status = child.wait().expect("server should exit after SIGINT");
+    let _ = fs::remove_file(config_path);
+    assert!(status.success());
 }
 
 #[test]

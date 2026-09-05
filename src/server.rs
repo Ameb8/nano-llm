@@ -9,14 +9,304 @@ use crate::response::{ChatChunk, ChatResponse, ToolCall};
 use std::fmt::Write;
 use std::fmt::{self, Display};
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read, Write as IoWrite};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+// Signal handlers are intentionally limited to setting this lock-free flag.
+// In particular, they do not close sockets or join worker threads; those are
+// ordinary runtime operations performed by the listener loop.
+static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A programmatic shutdown handle for embedding and integration tests.
+///
+/// The process runtime also observes SIGINT and SIGTERM.  Requesting shutdown
+/// only stops the accept loop; already accepted connections are retained until
+/// their application work has completed.
+#[derive(Clone, Default)]
+pub struct Shutdown(Arc<std::sync::atomic::AtomicBool>);
+
+impl Shutdown {
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Run the plain-HTTP listener until SIGINT or SIGTERM requests graceful
+/// shutdown. There is deliberately no shutdown deadline: the process owner
+/// decides whether and when to force termination.
+pub fn serve(application: Application, bind: SocketAddr) -> io::Result<()> {
+    install_termination_handlers()?;
+    TERMINATION_REQUESTED.store(false, Ordering::Release);
+    run_listener(application, bind, Shutdown::default(), true)
+}
+
+/// Run a listener using an explicit shutdown handle. This is the same runtime
+/// used by [`serve`], exposed so transports can be tested without process
+/// signals. It does not install or observe process signal handlers.
+pub fn serve_until(
+    application: Application,
+    bind: SocketAddr,
+    shutdown: Shutdown,
+) -> io::Result<()> {
+    run_listener(application, bind, shutdown, false)
+}
+
+fn run_listener(
+    application: Application,
+    bind: SocketAddr,
+    shutdown: Shutdown,
+    observe_signals: bool,
+) -> io::Result<()> {
+    let listener = TcpListener::bind(bind)?;
+    listener.set_nonblocking(true)?;
+    let mut workers = Vec::new();
+
+    while !shutdown.requested()
+        && !(observe_signals && TERMINATION_REQUESTED.load(Ordering::Acquire))
+    {
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                // A signal may have arrived while accept was waiting. Do not
+                // start new application work in that case.
+                if shutdown.requested()
+                    || (observe_signals && TERMINATION_REQUESTED.load(Ordering::Acquire))
+                {
+                    drop(stream);
+                    break;
+                }
+                let application = application.clone();
+                workers.push(thread::spawn(move || serve_connection(stream, application)));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    // No timeout belongs here. A worker owns an already accepted request or
+    // stream and is allowed to make progress until its normal completion.
+    for worker in workers {
+        let _ = worker.join();
+    }
+    Ok(())
+}
+
+fn serve_connection(mut stream: TcpStream, application: Application) {
+    let Ok(request) = read_http_request(&mut stream) else {
+        return;
+    };
+    let response = application.handle(&request);
+    let _ = write_http_response(&mut stream, &response);
+}
+
+fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+    let mut bytes = Vec::new();
+    let header_end = loop {
+        if bytes.len() > MAX_HTTP_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request headers are too large",
+            ));
+        }
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete request headers",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end + 4;
+        }
+    };
+
+    let (method, path, headers, content_length) = parse_http_head(&bytes[..header_end])?;
+    if content_length > MAX_REQUEST_BODY_BYTES + 1 {
+        // The application seam owns the canonical 413 envelope. It needs only
+        // one byte beyond the cap to make that deterministic.
+        return Ok(HttpRequest::new(method, path)
+            .with_headers(headers)
+            .with_body(vec![0; MAX_REQUEST_BODY_BYTES + 1]));
+    }
+    let mut body = bytes[header_end..].to_vec();
+    while body.len() < content_length {
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete request body",
+            ));
+        }
+        let needed = content_length - body.len();
+        body.extend_from_slice(&chunk[..read.min(needed)]);
+    }
+    body.truncate(content_length);
+    Ok(HttpRequest::new(method, path)
+        .with_headers(headers)
+        .with_body(body))
+}
+
+fn parse_http_head(bytes: &[u8]) -> io::Result<(String, String, Vec<(String, Vec<u8>)>, usize)> {
+    let Some(request_line_end) = bytes.windows(2).position(|window| window == b"\r\n") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing request line",
+        ));
+    };
+    let request_line = std::str::from_utf8(&bytes[..request_line_end])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 request line"))?;
+    let mut request_parts = request_line.split_ascii_whitespace();
+    let (Some(method), Some(target), Some(version), None) = (
+        request_parts.next(),
+        request_parts.next(),
+        request_parts.next(),
+        request_parts.next(),
+    ) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid request line",
+        ));
+    };
+    if !version.starts_with("HTTP/") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid HTTP version",
+        ));
+    }
+    let method = method.to_owned();
+    if !target.starts_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported request target",
+        ));
+    }
+    let path = target
+        .split_once('?')
+        .map_or(target, |(path, _)| path)
+        .to_owned();
+
+    let mut headers = Vec::new();
+    let mut content_length = None;
+    let mut remaining = &bytes[request_line_end + 2..];
+    while !remaining.is_empty() {
+        let Some(line_end) = remaining.windows(2).position(|window| window == b"\r\n") else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header"));
+        };
+        let line = &remaining[..line_end];
+        remaining = &remaining[line_end + 2..];
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header"));
+        };
+        let name = std::str::from_utf8(&line[..colon])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 header name"))?;
+        if name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty header name",
+            ));
+        }
+        let value = line[colon + 1..]
+            .iter()
+            .copied()
+            .skip_while(|byte| matches!(byte, b' ' | b'\t'))
+            .collect::<Vec<_>>();
+        if name.eq_ignore_ascii_case("content-length") {
+            let parsed = std::str::from_utf8(&value)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid content length")
+                })?;
+            if content_length.replace(parsed).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "repeated content length",
+                ));
+            }
+        }
+        headers.push((name.to_owned(), value));
+    }
+    Ok((method, path, headers, content_length.unwrap_or(0)))
+}
+
+fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::Result<()> {
+    let reason = match response.status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Error",
+    };
+    write!(stream, "HTTP/1.1 {} {reason}\r\n", response.status)?;
+    for (name, value) in &response.headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(
+        stream,
+        "content-length: {}\r\nconnection: close\r\n\r\n",
+        response.body.len()
+    )?;
+    stream.write_all(&response.body)
+}
+
+#[cfg(unix)]
+fn install_termination_handlers() -> io::Result<()> {
+    type SignalHandler = usize;
+    unsafe extern "C" {
+        fn signal(signal: std::os::raw::c_int, handler: SignalHandler) -> SignalHandler;
+    }
+    extern "C" fn request_shutdown(_: std::os::raw::c_int) {
+        TERMINATION_REQUESTED.store(true, Ordering::Release);
+    }
+    // `signal` is used only to install an async-signal-safe handler which
+    // performs a lock-free atomic store. Failure is reported rather than
+    // silently serving without graceful termination behavior.
+    unsafe {
+        if signal(2, request_shutdown as SignalHandler) == usize::MAX
+            || signal(15, request_shutdown as SignalHandler) == usize::MAX
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_termination_handlers() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "graceful signal shutdown requires a Unix platform",
+    ))
+}
 
 /// An inbound request whose headers retain every raw field occurrence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +358,11 @@ impl HttpRequest {
 
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    fn with_headers(mut self, headers: Vec<(String, Vec<u8>)>) -> Self {
+        self.headers = headers;
         self
     }
 

@@ -37,10 +37,10 @@ pub use response::{
     StreamAssembler, ToolCall, ToolCallDelta, Usage,
 };
 pub use server::{
-    app, app_with_provider_factory, app_with_provider_factory_and_clock, Application,
-    AttemptOutcome, AttemptRecord, DownstreamCancellation, GatewayError, GatewayErrorKind,
-    HttpRequest, HttpResponse, MonotonicClock, ProviderFactory, RouteDiagnostics, RouteDispatch,
-    RouteExhausted, StreamRouteDispatch,
+    app, app_with_provider_factory, app_with_provider_factory_and_clock, serve, serve_until,
+    Application, AttemptOutcome, AttemptRecord, DownstreamCancellation, GatewayError,
+    GatewayErrorKind, HttpRequest, HttpResponse, MonotonicClock, ProviderFactory, RouteDiagnostics,
+    RouteDispatch, RouteExhausted, Shutdown, StreamRouteDispatch,
 };
 
 /// Returns the package version string.

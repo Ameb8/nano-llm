@@ -1,5 +1,6 @@
 use nano_llm::cli::{Cli, CliError};
 use nano_llm::config::{build_runtime_config, parse_yaml_str, SystemEnv};
+use nano_llm::{app, serve};
 use std::fs;
 use std::process::ExitCode;
 
@@ -56,7 +57,12 @@ fn main() -> ExitCode {
         if cli.no_auth {
             eprintln!("WARNING: running with --no-auth; inbound authentication is disabled");
         }
-        // Server mode: HTTP listener is implemented in subsequent milestones.
-        ExitCode::SUCCESS
+        match serve(app(runtime_config, cli.no_auth), cli.bind) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: failed to serve HTTP on {}: {error}", cli.bind);
+                ExitCode::from(1)
+            }
+        }
     }
 }

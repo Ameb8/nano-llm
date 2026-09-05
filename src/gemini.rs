@@ -1,8 +1,8 @@
 //! Gemini Generative Language request translation.
 //!
 //! This module owns the pinned v1beta operation shape and the conversion from
-//! the gateway's canonical conversation into Gemini `contents`. Response and
-//! SSE decoding intentionally belong to a later adapter slice.
+//! the gateway's canonical conversation into Gemini `contents`, plus strict
+//! normalization of Gemini responses and incremental SSE events.
 
 use crate::config::{ProviderKind, RuntimeTarget};
 use crate::providers::{
@@ -11,10 +11,11 @@ use crate::providers::{
 };
 use crate::request::{decode_json_value, CanonicalRequest, JsonValue, ToolChoice};
 use crate::response::{
-    normalize_response, normalize_usage, safety_response, ChatResponse, NativeChoice,
-    NativeResponse, NativeTerminal, NativeToolCall, ResponseError, ResponseMetadata, Usage,
+    normalize_response, normalize_usage, safety_response, AssistantDelta, ChatChunk, ChatResponse,
+    NativeChoice, NativeResponse, NativeTerminal, NativeToolCall, ResponseError, ResponseMetadata,
+    StreamAssembler, ToolCallDelta, Usage,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// Gemini Generative Language API adapter for a single validated target.
@@ -139,9 +140,376 @@ impl Provider for GeminiProvider {
             if !(200..300).contains(&response.status) {
                 return Err(TargetError::from_upstream_status(response.status));
             }
-            // Gemini SSE parsing is explicitly outside this slice.
-            Err(TargetError::invalid_response())
+            Ok(Box::new(GeminiSseDecoder::new(
+                request.clone(),
+                ResponseMetadata::for_model(&request.model),
+                response.body,
+            )) as ProviderStream)
         })
+    }
+}
+
+/// Maximum decoded payload of one Gemini SSE event. Transport fragments may
+/// split an SSE field or JSON value at arbitrary byte boundaries.
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
+/// Incremental decoder for Gemini's `streamGenerateContent` response. Gemini
+/// does not send an OpenAI-style `[DONE]` marker: a valid native terminal
+/// candidate followed by EOF is the successful lifecycle.
+pub struct GeminiSseDecoder {
+    source: crate::providers::OutboundByteStream,
+    assembler: StreamAssembler,
+    input: Vec<u8>,
+    data: Vec<u8>,
+    pending: VecDeque<Result<ChatChunk, TargetError>>,
+    native_calls: HashMap<String, GeminiCall>,
+    /// An ID repeated for separate calls in one native candidate cannot safely
+    /// identify a later delta.  Do not silently attach that delta to either
+    /// call.
+    ambiguous_native_ids: HashSet<String>,
+    declared_tools: HashSet<String>,
+    tool_choice: ToolChoice,
+    next_call: usize,
+    done: bool,
+    exhausted: bool,
+    prompt_tokens: Option<u128>,
+    completion_tokens: Option<u128>,
+    invalid_usage: bool,
+}
+
+#[derive(Clone)]
+struct GeminiCall {
+    index: usize,
+    name: String,
+}
+
+impl GeminiSseDecoder {
+    fn new(
+        request: CanonicalRequest,
+        metadata: ResponseMetadata,
+        source: crate::providers::OutboundByteStream,
+    ) -> Self {
+        Self {
+            source,
+            assembler: StreamAssembler::new(&request, metadata),
+            input: Vec::new(),
+            data: Vec::new(),
+            pending: VecDeque::new(),
+            native_calls: HashMap::new(),
+            ambiguous_native_ids: HashSet::new(),
+            declared_tools: declared_tool_names(&request),
+            tool_choice: request.tool_choice.clone(),
+            next_call: 0,
+            done: false,
+            exhausted: false,
+            prompt_tokens: None,
+            completion_tokens: None,
+            invalid_usage: false,
+        }
+    }
+
+    fn invalid() -> TargetError {
+        TargetError::invalid_response()
+    }
+
+    fn line(&mut self, mut line: Vec<u8>) -> Result<(), TargetError> {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() {
+            return self.dispatch();
+        }
+        if line[0] == b':' {
+            return Ok(());
+        }
+        if let Some(value) = line.strip_prefix(b"data:") {
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            let extra = value.len() + usize::from(!self.data.is_empty());
+            if self.data.len().saturating_add(extra) > MAX_SSE_EVENT_BYTES {
+                return Err(Self::invalid());
+            }
+            if !self.data.is_empty() {
+                self.data.push(b'\n');
+            }
+            self.data.extend_from_slice(value);
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self) -> Result<(), TargetError> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        let payload = std::mem::take(&mut self.data);
+        let root = crate::request::decode_json_object(&payload).map_err(|_| Self::invalid())?;
+        self.capture_usage(&root);
+        // Gemini may report usage in a separate event after the terminal
+        // candidate.  It remains adapter metadata, not a second completion.
+        if self.done {
+            return field(&root, "candidates")
+                .is_none()
+                .then_some(())
+                .filter(|_| field(&root, "usageMetadata").is_some())
+                .ok_or_else(Self::invalid);
+        }
+        match field(&root, "candidates") {
+            Some(JsonValue::Array(candidates)) if candidates.len() == 1 => {
+                self.candidate(&candidates[0])
+            }
+            // A usage-only event is metadata, never an observable zero-choice
+            // chunk. Missing candidates without this native metadata remains
+            // malformed rather than becoming an empty completion.
+            None if field(&root, "usageMetadata").is_some() => Ok(()),
+            Some(JsonValue::Array(candidates))
+                if candidates.is_empty() && explicit_policy_block(&root) =>
+            {
+                self.policy_terminal()
+            }
+            None if explicit_policy_block(&root) => self.policy_terminal(),
+            _ => Err(Self::invalid()),
+        }
+    }
+
+    fn capture_usage(&mut self, root: &[(String, JsonValue)]) {
+        let Some(value) = field(root, "usageMetadata") else {
+            return;
+        };
+        let JsonValue::Object(usage) = value else {
+            self.invalid_usage = true;
+            return;
+        };
+        match usage_component(field(usage, "promptTokenCount")) {
+            Ok(Some(value)) => self.prompt_tokens = Some(value),
+            Ok(None) => {}
+            Err(()) => self.invalid_usage = true,
+        }
+        match usage_component(field(usage, "candidatesTokenCount")) {
+            Ok(Some(value)) => self.completion_tokens = Some(value),
+            Ok(None) => {}
+            Err(()) => self.invalid_usage = true,
+        }
+    }
+
+    fn candidate(&mut self, value: &JsonValue) -> Result<(), TargetError> {
+        let candidate = object(value)?;
+        if let Some(index) = field(candidate, "index") {
+            if unsigned(index)? != 0 {
+                return Err(Self::invalid());
+            }
+        }
+        let terminal = match field(candidate, "finishReason") {
+            None => None,
+            Some(JsonValue::String(reason)) => Some(terminal(reason)),
+            Some(_) => return Err(Self::invalid()),
+        };
+        let delta = match field(candidate, "content") {
+            Some(content) => self.content(content)?,
+            None if matches!(terminal, Some(NativeTerminal::ContentFilter)) => {
+                AssistantDelta::default()
+            }
+            None => return Err(Self::invalid()),
+        };
+        self.push(delta, terminal)
+    }
+
+    fn content(&mut self, value: &JsonValue) -> Result<AssistantDelta, TargetError> {
+        let content = object(value)?;
+        match field(content, "role") {
+            None => {}
+            Some(JsonValue::String(role)) if role == "model" => {}
+            _ => return Err(Self::invalid()),
+        }
+        let parts = array(required(content, "parts")?)?;
+        let mut delta = AssistantDelta::default();
+        let mut event_call_ids = HashSet::new();
+        for part in parts {
+            let part = object(part)?;
+            match (field(part, "text"), field(part, "functionCall")) {
+                (Some(JsonValue::String(text)), None) => {
+                    let output = delta.content.get_or_insert_with(String::new);
+                    output.push_str(text);
+                }
+                (None, Some(call)) => delta.tool_calls.push(self.call(call, &mut event_call_ids)?),
+                _ => return Err(Self::invalid()),
+            }
+        }
+        Ok(delta)
+    }
+
+    fn call(
+        &mut self,
+        value: &JsonValue,
+        event_call_ids: &mut HashSet<String>,
+    ) -> Result<ToolCallDelta, TargetError> {
+        let call = object(value)?;
+        let native_id = match field(call, "id") {
+            None => None,
+            Some(JsonValue::String(id)) if !id.is_empty() => Some(id.clone()),
+            Some(JsonValue::String(_)) => None,
+            Some(_) => return Err(Self::invalid()),
+        };
+        let name = string(required(call, "name")?)?.to_owned();
+        if name.is_empty()
+            || !self.declared_tools.contains(&name)
+            || matches!(&self.tool_choice, ToolChoice::None)
+            || matches!(&self.tool_choice, ToolChoice::Named(expected) if expected != &name)
+        {
+            return Err(Self::invalid());
+        }
+        let JsonValue::Object(args) = required(call, "args")? else {
+            return Err(Self::invalid());
+        };
+        let arguments = encode(&JsonValue::Object(args.to_vec()));
+        if let Some(native_id) = native_id {
+            if self.ambiguous_native_ids.contains(&native_id) {
+                return Err(Self::invalid());
+            }
+            if !event_call_ids.insert(native_id.clone()) {
+                // Native duplicate IDs identify distinct calls only in this
+                // event.  Give the later call a gateway ID and reject any
+                // subsequent ambiguous update rather than coalescing calls.
+                self.ambiguous_native_ids.insert(native_id);
+                return Ok(self.new_call(name, arguments));
+            }
+            if let Some(existing) = self.native_calls.get(&native_id) {
+                if existing.name != name {
+                    return Err(Self::invalid());
+                }
+                return Ok(ToolCallDelta {
+                    index: existing.index,
+                    id: Some(native_id),
+                    r#type: None,
+                    name: None,
+                    arguments: Some(arguments),
+                });
+            }
+            let index = self.next_call;
+            self.next_call += 1;
+            self.native_calls.insert(
+                native_id.clone(),
+                GeminiCall {
+                    index,
+                    name: name.clone(),
+                },
+            );
+            Ok(ToolCallDelta {
+                index,
+                id: Some(native_id),
+                r#type: Some("function"),
+                name: Some(name),
+                arguments: Some(arguments),
+            })
+        } else {
+            // Without a native correlation ID, Gemini provides no safe way to
+            // merge same-name calls. Treat each part as a new call so repeated
+            // names remain distinct rather than silently coalescing them.
+            Ok(self.new_call(name, arguments))
+        }
+    }
+
+    fn new_call(&mut self, name: String, arguments: String) -> ToolCallDelta {
+        let index = self.next_call;
+        self.next_call += 1;
+        ToolCallDelta {
+            index,
+            id: None,
+            r#type: Some("function"),
+            name: Some(name),
+            arguments: Some(arguments),
+        }
+    }
+
+    fn policy_terminal(&mut self) -> Result<(), TargetError> {
+        self.push(
+            AssistantDelta::default(),
+            Some(NativeTerminal::ContentFilter),
+        )
+    }
+
+    fn push(
+        &mut self,
+        delta: AssistantDelta,
+        terminal: Option<NativeTerminal>,
+    ) -> Result<(), TargetError> {
+        if let Some(chunk) = self
+            .assembler
+            .push(0, delta, terminal)
+            .map_err(response_error)?
+        {
+            self.pending.push_back(Ok(chunk));
+        }
+        if terminal.is_some() {
+            self.done = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), TargetError> {
+        self.assembler.finish().map_err(response_error)?;
+        if !self.invalid_usage {
+            if let Some(usage) = normalize_usage(self.prompt_tokens, self.completion_tokens) {
+                if let Some(chunk) = self.assembler.usage_chunk(usage).map_err(response_error)? {
+                    self.pending.push_back(Ok(chunk));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn next_event(&mut self) -> Result<bool, TargetError> {
+        loop {
+            if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<_> = self.input.drain(..=newline).collect();
+                self.line(line[..line.len() - 1].to_vec())?;
+                return Ok(true);
+            }
+            match self.source.next() {
+                Some(Ok(bytes)) => {
+                    if self.input.len().saturating_add(bytes.len())
+                        > MAX_SSE_EVENT_BYTES + 64 * 1024
+                    {
+                        return Err(Self::invalid());
+                    }
+                    self.input.extend_from_slice(&bytes);
+                }
+                Some(Err(_)) => return Err(TargetError::connection()),
+                None => {
+                    self.exhausted = true;
+                    if !self.input.is_empty() || !self.data.is_empty() || !self.done {
+                        return Err(Self::invalid());
+                    }
+                    self.finish()?;
+                    return Ok(false);
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for GeminiSseDecoder {
+    type Item = Result<ChatChunk, TargetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.pending.pop_front() {
+            return Some(item);
+        }
+        if self.exhausted {
+            return None;
+        }
+        loop {
+            match self.next_event() {
+                Ok(false) => return self.pending.pop_front(),
+                Ok(true) => {
+                    if let Some(item) = self.pending.pop_front() {
+                        return Some(item);
+                    }
+                }
+                Err(error) => {
+                    self.exhausted = true;
+                    return Some(Err(error));
+                }
+            }
+        }
     }
 }
 
@@ -281,13 +649,51 @@ fn unsigned_optional(value: &JsonValue) -> Option<u128> {
     value.parse().ok()
 }
 
+/// A streaming usage event may report its two components at different times.
+/// Preserve valid components independently, but poison the optional usage
+/// result if a component it does report is malformed.
+fn usage_component(value: Option<&JsonValue>) -> Result<Option<u128>, ()> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let JsonValue::Number(value) = value else {
+        return Err(());
+    };
+    if value.contains(['.', 'e', 'E']) {
+        return Err(());
+    }
+    value.parse().map(Some).map_err(|_| ())
+}
+
+fn declared_tool_names(request: &CanonicalRequest) -> HashSet<String> {
+    let Some(JsonValue::Array(tools)) = field(&request.fields, "tools") else {
+        return HashSet::new();
+    };
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let JsonValue::Object(tool) = tool else {
+                return None;
+            };
+            let JsonValue::Object(function) = field(tool, "function")? else {
+                return None;
+            };
+            let JsonValue::String(name) = field(function, "name")? else {
+                return None;
+            };
+            Some(name.clone())
+        })
+        .collect()
+}
+
 fn explicit_policy_block(root: &[(String, JsonValue)]) -> bool {
     let Some(JsonValue::Object(feedback)) = field(root, "promptFeedback") else {
         return false;
     };
     matches!(field(feedback, "blockReason"),
         Some(JsonValue::String(reason)) if matches!(reason.as_str(),
-            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "IMAGE_SAFETY" | "JAILBREAK" | "MODEL_ARMOR" | "OTHER"))
+            "SAFETY" | "RECITATION" | "LANGUAGE" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII"
+            | "IMAGE_SAFETY" | "JAILBREAK" | "MODEL_ARMOR" | "OTHER"))
 }
 
 fn terminal(reason: &str) -> NativeTerminal {
@@ -960,6 +1366,117 @@ mod tests {
         ] {
             assert!(matches!(normalized(request, payload), Err(error)
                 if error.kind == crate::providers::TargetErrorKind::InvalidResponse));
+        }
+    }
+
+    fn streamed(request: &str, fragments: &[&str]) -> Vec<Result<ChatChunk, TargetError>> {
+        let request = decode_chat_request(request.as_bytes()).unwrap();
+        let fragments: Vec<_> = fragments
+            .iter()
+            .map(|part| Ok(part.as_bytes().to_vec()))
+            .collect();
+        GeminiSseDecoder::new(
+            request.clone(),
+            ResponseMetadata::for_model(&request.model),
+            Box::new(fragments.into_iter()),
+        )
+        .collect()
+    }
+
+    #[test]
+    fn streams_fragmented_text_distinct_same_name_calls_and_usage() {
+        let events = concat!(
+            "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hel\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"one\",\"name\":\"weather\",\"args\":{\"city\":\"Paris\"}}},{\"functionCall\":{\"id\":\"two\",\"name\":\"weather\",\"args\":{\"city\":\"Rome\"}}}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":3}}\n\n"
+        );
+        // Deliberately split inside both SSE and JSON framing.
+        let output = streamed(
+            r#"{"model":"public","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"weather"}}]}"#,
+            &[&events[..41], &events[41..187], &events[187..]],
+        );
+        assert_eq!(output.len(), 4);
+        let first = output[0].as_ref().unwrap();
+        assert_eq!(first.choices[0].delta.role, Some("assistant"));
+        assert_eq!(first.choices[0].delta.content.as_deref(), Some("Hel"));
+        let calls = &output[1].as_ref().unwrap().choices[0].delta.tool_calls;
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].index, calls[0].id.as_deref()), (0, Some("one")));
+        assert_eq!((calls[1].index, calls[1].id.as_deref()), (1, Some("two")));
+        let terminal = output[2].as_ref().unwrap();
+        assert_eq!(terminal.choices[0].delta.content.as_deref(), Some("lo"));
+        assert_eq!(
+            terminal.choices[0].finish_reason.unwrap().as_str(),
+            "tool_calls"
+        );
+        let usage = output[3].as_ref().unwrap();
+        assert!(usage.choices.is_empty());
+        assert_eq!(usage.usage.as_ref().unwrap().total_tokens, 5);
+    }
+
+    #[test]
+    fn streams_candidate_less_policy_as_role_bearing_terminal() {
+        let output = streamed(
+            r#"{"model":"public","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            &["data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}\n\n"],
+        );
+        assert_eq!(output.len(), 1);
+        let chunk = output[0].as_ref().unwrap();
+        assert_eq!(chunk.choices[0].delta.role, Some("assistant"));
+        assert_eq!(chunk.choices[0].delta.content, None);
+        assert_eq!(
+            chunk.choices[0].finish_reason.unwrap().as_str(),
+            "content_filter"
+        );
+    }
+
+    #[test]
+    fn retains_usage_sent_after_the_terminal_candidate() {
+        let output = streamed(
+            r#"{"model":"public","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}"#,
+            &[
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+                "data: {\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":3}}\n\n",
+            ],
+        );
+        assert_eq!(output.len(), 2);
+        assert_eq!(
+            output[1]
+                .as_ref()
+                .unwrap()
+                .usage
+                .as_ref()
+                .unwrap()
+                .total_tokens,
+            5
+        );
+    }
+
+    #[test]
+    fn rejects_an_undeclared_call_before_emitting_a_chunk() {
+        let output = streamed(
+            r#"{"model":"public","stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"weather"}}]}"#,
+            &["data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"other\",\"args\":{}}}]}}]}\n\n"],
+        );
+        assert!(
+            matches!(output.as_slice(), [Err(error)] if error.kind == crate::providers::TargetErrorKind::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_repeated_and_malformed_stream_state() {
+        let request =
+            r#"{"model":"public","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        for events in [
+            "data: {\"usageMetadata\":{\"promptTokenCount\":1}}\n\n",
+            concat!(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"x\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"y\"}]}}]}\n\n"
+            ),
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"x\",\"args\":[]}}]}}]}\n\n",
+        ] {
+            let output = streamed(request, &[events]);
+            assert!(output.last().is_some_and(|item| matches!(item, Err(error) if error.kind == crate::providers::TargetErrorKind::InvalidResponse)));
         }
     }
 }

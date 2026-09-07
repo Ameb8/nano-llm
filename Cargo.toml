@@ -5,6 +5,22 @@ edition = "2021"
 description = "A lightweight, single-binary LLM routing gateway in Rust"
 readme = "README.md"
 
+[features]
+# This is intentionally off for normal and release builds.  It permits the
+# executable conformance test to add its own loopback CA as an *additional*
+# root; it never disables certificate or hostname verification.
+executable-test-tls = []
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 saphyr-parser = "0.0.12"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Keep TLS self-contained for the scratch image.  In particular, do not enable
+# reqwest's native-tls/default features: verification must use packaged WebPKI
+# roots rather than files supplied by the host image.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+rustls = "0.22"
+rustls-pemfile = "2.2"

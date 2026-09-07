@@ -32,9 +32,29 @@ tasks:
     cmds:
       - cargo test --all-targets --all-features
 
+  executable-matrix:
+    desc: Run the compiled-binary provider conformance matrix with loopback TLS
+    cmds:
+      - cargo test --features executable-test-tls --test executable_matrix_tests -- --test-threads=1
+
   check:
     desc: Canonical quality check (format verification, linting, and tests)
     cmds:
       - task: format-check
       - task: lint
       - task: test
+
+  release-linux:
+    desc: Export, inspect, and smoke-test static Linux x86_64 and aarch64 binaries
+    cmds:
+      - docker buildx build --platform linux/amd64 --target artifact --output type=local,dest=dist/x86_64 .
+      - NANO_LLM_REQUIRE_EXECUTION=1 scripts/verify-static-artifact.sh x86_64 dist/x86_64/nano-llm
+      - scripts/smoke-release-artifact.sh x86_64 dist/x86_64/nano-llm
+      - docker buildx build --platform linux/arm64 --target artifact --output type=local,dest=dist/aarch64 .
+      - NANO_LLM_REQUIRE_EXECUTION=1 scripts/verify-static-artifact.sh aarch64 dist/aarch64/nano-llm
+      - scripts/smoke-release-artifact.sh aarch64 dist/aarch64/nano-llm
+
+  image:
+    desc: Build the minimal scratch runtime image for the host architecture
+    cmds:
+      - docker build --tag nano-llm:local .

@@ -1,0 +1,1444 @@
+use nano_llm::{
+    app_with_provider_factory, app_with_provider_factory_and_clock, AssistantDelta,
+    CanonicalRequest, ChatChoice, ChatChunk, ChatResponse, ChunkChoice, FinishReason, HttpRequest,
+    Provider, ProviderFuture, ProviderStream, RuntimeConfig, RuntimeGeneralSettings, RuntimeRoute,
+    RuntimeTarget, TargetError,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogCapture {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
+
+fn target(suffix: &str) -> RuntimeTarget {
+    RuntimeTarget {
+        model: format!("openai/{suffix}"),
+        provider: nano_llm::ProviderKind::OpenAi,
+        model_suffix: suffix.into(),
+        api_key: None,
+        api_base: "https://example.test/v1".into(),
+        timeout: 30,
+        explicit_timeout: None,
+    }
+}
+
+fn application(
+    targets: Vec<RuntimeTarget>,
+    seen_targets: Arc<Mutex<Vec<String>>>,
+    seen_requests: Arc<Mutex<Vec<CanonicalRequest>>>,
+    fail: bool,
+) -> nano_llm::Application {
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            max_in_flight: 1,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets,
+        }],
+    };
+    let factory = Arc::new(move |target: RuntimeTarget| -> Box<dyn Provider> {
+        seen_targets.lock().unwrap().push(target.model_suffix);
+        Box::new(RecordingProvider {
+            seen_requests: seen_requests.clone(),
+            fail,
+        })
+    });
+    app_with_provider_factory(config, true, factory)
+}
+
+struct RecordingProvider {
+    seen_requests: Arc<Mutex<Vec<CanonicalRequest>>>,
+    fail: bool,
+}
+
+impl Provider for RecordingProvider {
+    fn complete<'a>(
+        &'a self,
+        request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        self.seen_requests.lock().unwrap().push(request.clone());
+        let result = if self.fail {
+            Err(TargetError::connection())
+        } else {
+            Ok(ChatResponse {
+                id: "complete-id".into(),
+                object: "chat.completion",
+                created: 42,
+                model: request.model.clone(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: nano_llm::AssistantMessage {
+                        role: "assistant",
+                        content: Some("complete reply".into()),
+                        tool_calls: None,
+                    },
+                    finish_reason: FinishReason::Stop,
+                }],
+                usage: None,
+            })
+        };
+        Box::pin(async move { result })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+}
+
+fn chat(body: impl Into<Vec<u8>>) -> HttpRequest {
+    HttpRequest::new("POST", "/v1/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(body)
+}
+
+#[test]
+fn unknown_model_and_canonical_failures_do_not_construct_a_provider() {
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let application = application(
+        vec![target("first")],
+        targets.clone(),
+        requests.clone(),
+        false,
+    );
+
+    let unknown = application.handle(&chat(
+        br#"{"model":"missing","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+    assert_eq!(unknown.status, 404);
+    assert_eq!(unknown.body, br#"{"error":{"message":"Model not found","type":"not_found_error","param":"model","code":"model_not_found"}}"#);
+
+    let invalid = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"assistant","content":"bad"}]}"#,
+    ));
+    assert_eq!(invalid.status, 400);
+    assert!(std::str::from_utf8(&invalid.body)
+        .unwrap()
+        .contains("invalid_request"));
+    assert!(targets.lock().unwrap().is_empty());
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn first_target_receives_one_immutable_canonical_request_and_full_success_is_serialized() {
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let application = application(
+        vec![target("first"), target("must-not-run")],
+        targets.clone(),
+        requests.clone(),
+        false,
+    );
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":7}"#,
+    ));
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, br#"{"id":"complete-id","object":"chat.completion","created":42,"model":"public","choices":[{"index":0,"message":{"role":"assistant","content":"complete reply"},"finish_reason":"stop"}]}"#);
+    assert_eq!(*targets.lock().unwrap(), vec!["first"]);
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].model, "public");
+    assert_eq!(recorded[0].max_tokens, Some(7));
+    assert_eq!(recorded[0].fields[0].0, "model");
+}
+
+#[test]
+fn every_failed_route_entry_is_tried_once_before_the_safe_502() {
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let application = application(
+        vec![target("first"), target("fallback")],
+        targets.clone(),
+        requests,
+        true,
+    );
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+
+    assert_eq!(response.status, 502);
+    assert_eq!(response.body, br#"{"error":{"message":"All configured upstream targets failed","type":"server_error","param":null,"code":"upstream_exhausted"}}"#);
+    assert_eq!(*targets.lock().unwrap(), vec!["first", "fallback"]);
+}
+
+#[derive(Clone)]
+enum SequencedOutcome {
+    Failure(TargetError),
+    Success(ChatResponse),
+}
+
+struct SequencedProvider(SequencedOutcome);
+
+impl Provider for SequencedProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        let outcome = self.0.clone();
+        Box::pin(async move {
+            match outcome {
+                SequencedOutcome::Failure(error) => Err(error),
+                SequencedOutcome::Success(response) => Ok(response),
+            }
+        })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+}
+
+fn sequenced_application(
+    outcomes: Vec<SequencedOutcome>,
+    seen: Arc<Mutex<Vec<String>>>,
+) -> nano_llm::Application {
+    let targets = (0..outcomes.len())
+        .map(|index| target(&format!("entry-{index}")))
+        .collect();
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets,
+        }],
+    };
+    let next = Arc::new(AtomicUsize::new(0));
+    app_with_provider_factory(
+        config,
+        true,
+        Arc::new(move |target| {
+            seen.lock().unwrap().push(target.model_suffix);
+            let index = next.fetch_add(1, Ordering::AcqRel);
+            Box::new(SequencedProvider(outcomes[index].clone()))
+        }),
+    )
+}
+
+fn successful_response(finish_reason: FinishReason) -> ChatResponse {
+    let tool_calls = (finish_reason == FinishReason::ToolCalls).then(|| {
+        vec![nano_llm::ToolCall {
+            id: "call_1".into(),
+            r#type: "function",
+            function: nano_llm::FunctionCall {
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        }]
+    });
+    ChatResponse {
+        id: "canonical-winner".into(),
+        object: "chat.completion",
+        created: 9,
+        model: "public".into(),
+        choices: vec![ChatChoice {
+            index: 0,
+            message: nano_llm::AssistantMessage {
+                role: "assistant",
+                content: (finish_reason != FinishReason::ToolCalls).then(|| "winner".into()),
+                tool_calls,
+            },
+            finish_reason,
+        }],
+        usage: None,
+    }
+}
+
+#[test]
+fn all_target_error_kinds_advance_identically_in_file_order() {
+    let errors = vec![
+        TargetError::timeout(),
+        TargetError::connection(),
+        TargetError::from_upstream_status(429),
+        TargetError::from_upstream_status(401),
+        TargetError::from_upstream_status(403),
+        TargetError::from_upstream_status(400),
+        TargetError::invalid_response(),
+        TargetError::overloaded(),
+        TargetError::from_upstream_status(500),
+    ];
+    let mut outcomes: Vec<_> = errors.into_iter().map(SequencedOutcome::Failure).collect();
+    outcomes.push(SequencedOutcome::Success(successful_response(
+        FinishReason::Stop,
+    )));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let application = sequenced_application(outcomes, seen.clone());
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+
+    assert_eq!(response.status, 200);
+    assert!(std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("canonical-winner"));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        (0..10)
+            .map(|index| format!("entry-{index}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn first_middle_and_final_protocol_success_stop_further_attempts() {
+    for winner in [0, 1, 2] {
+        let mut outcomes = vec![
+            SequencedOutcome::Failure(TargetError::connection()),
+            SequencedOutcome::Failure(TargetError::connection()),
+            SequencedOutcome::Failure(TargetError::connection()),
+        ];
+        outcomes[winner] = SequencedOutcome::Success(successful_response(FinishReason::Stop));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let application = sequenced_application(outcomes, seen.clone());
+
+        assert_eq!(
+            application
+                .handle(&chat(
+                    br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .status,
+            200
+        );
+        assert_eq!(seen.lock().unwrap().len(), winner + 1);
+    }
+}
+
+#[test]
+fn semantic_successes_never_fall_back() {
+    for finish_reason in [
+        FinishReason::ContentFilter,
+        FinishReason::Length,
+        FinishReason::ToolCalls,
+    ] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let application = sequenced_application(
+            vec![
+                SequencedOutcome::Success(successful_response(finish_reason)),
+                SequencedOutcome::Failure(TargetError::connection()),
+            ],
+            seen.clone(),
+        );
+        let response = application.handle(&chat(
+            br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+        ));
+        assert_eq!(response.status, 200);
+        assert_eq!(*seen.lock().unwrap(), vec!["entry-0"]);
+    }
+}
+
+#[test]
+fn natural_language_refusal_is_a_success_and_does_not_fall_back() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut refusal = successful_response(FinishReason::Stop);
+    refusal.choices[0].message.content = Some("I cannot comply with that request.".into());
+    let application = sequenced_application(
+        vec![
+            SequencedOutcome::Success(refusal),
+            SequencedOutcome::Failure(TargetError::connection()),
+        ],
+        seen.clone(),
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+    assert_eq!(response.status, 200);
+    assert!(std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("cannot comply"));
+    assert_eq!(*seen.lock().unwrap(), vec!["entry-0"]);
+}
+
+#[test]
+fn repeated_target_is_retried_only_as_a_second_route_entry_and_attempts_are_safe() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let application = sequenced_application(
+        vec![
+            SequencedOutcome::Failure(TargetError::from_upstream_status(429)),
+            SequencedOutcome::Success(successful_response(FinishReason::Stop)),
+        ],
+        seen.clone(),
+    );
+    let route = RuntimeRoute {
+        model_name: "public".into(),
+        targets: vec![target("same-target"), target("same-target")],
+    };
+    let canonical = nano_llm::decode_chat_request(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    )
+    .unwrap();
+
+    let dispatch = application
+        .dispatch_route(
+            &route,
+            &canonical,
+            &nano_llm::DownstreamCancellation::default(),
+        )
+        .expect("second route entry succeeds");
+
+    assert_eq!(*seen.lock().unwrap(), vec!["same-target", "same-target"]);
+    assert_eq!(dispatch.response.id, "canonical-winner");
+    assert_eq!(dispatch.attempts.len(), 2);
+    assert_eq!(dispatch.attempts[0].route_index, 0);
+    assert_eq!(dispatch.attempts[0].target_model, "openai/same-target");
+    assert_eq!(
+        dispatch.attempts[0].outcome,
+        nano_llm::AttemptOutcome::Failed {
+            kind: nano_llm::TargetErrorKind::RateLimited,
+            upstream_status: Some(429),
+        }
+    );
+    assert_eq!(
+        dispatch.attempts[1].outcome,
+        nano_llm::AttemptOutcome::Succeeded
+    );
+}
+
+#[test]
+fn exhausted_dispatch_retains_only_safe_attempt_metadata() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let application = sequenced_application(
+        vec![
+            SequencedOutcome::Failure(TargetError::connection()),
+            SequencedOutcome::Failure(TargetError::from_upstream_status(500)),
+        ],
+        seen,
+    );
+    let route = RuntimeRoute {
+        model_name: "public".into(),
+        targets: vec![target("first"), target("second")],
+    };
+    let canonical = nano_llm::decode_chat_request(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    )
+    .unwrap();
+
+    let exhausted = application
+        .dispatch_route(
+            &route,
+            &canonical,
+            &nano_llm::DownstreamCancellation::default(),
+        )
+        .expect_err("all targets fail");
+
+    assert_eq!(exhausted.attempts.len(), 2);
+    assert_eq!(exhausted.attempts[0].route_index, 0);
+    assert_eq!(exhausted.attempts[0].target_model, "openai/first");
+    assert_eq!(
+        exhausted.attempts[1].outcome,
+        nano_llm::AttemptOutcome::Failed {
+            kind: nano_llm::TargetErrorKind::UpstreamHttp,
+            upstream_status: Some(500),
+        }
+    );
+    assert_eq!(exhausted.diagnostics.requested_model, "public");
+    assert_eq!(exhausted.diagnostics.attempt_count, 2);
+    assert_eq!(
+        exhausted.diagnostics.error_kind,
+        Some(nano_llm::TargetErrorKind::UpstreamHttp)
+    );
+    assert_eq!(exhausted.diagnostics.upstream_status, Some(500));
+}
+
+#[test]
+fn route_aware_validation_precedes_streaming_provider_work_and_releases_capacity() {
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut anthropic = target("claude");
+    anthropic.provider = nano_llm::ProviderKind::Anthropic;
+    let application = application(vec![anthropic], targets.clone(), requests.clone(), false);
+
+    let missing_limit = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+    assert_eq!(missing_limit.status, 400);
+    assert!(targets.lock().unwrap().is_empty());
+
+    let stream = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":true}"#,
+    ));
+    assert_eq!(stream.status, 502);
+    assert_eq!(*targets.lock().unwrap(), vec!["claude"]);
+
+    let valid =
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#;
+    assert_eq!(application.handle(&chat(valid)).status, 200);
+    // The second request would receive 503 if the successful request's permit
+    // were not released exactly once at the end of provider dispatch.
+    assert_eq!(application.handle(&chat(valid)).status, 200);
+    assert_eq!(*targets.lock().unwrap(), vec!["claude", "claude", "claude"]);
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[derive(Clone)]
+enum StreamOutcome {
+    SetupError(TargetError),
+    Events(Vec<Result<ChatChunk, TargetError>>),
+}
+
+struct SequencedStreamProvider(StreamOutcome);
+
+impl Provider for SequencedStreamProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        let outcome = self.0.clone();
+        Box::pin(async move {
+            match outcome {
+                StreamOutcome::SetupError(error) => Err(error),
+                StreamOutcome::Events(events) => Ok(Box::new(events.into_iter()) as ProviderStream),
+            }
+        })
+    }
+}
+
+fn canonical_chunk(content: &str) -> ChatChunk {
+    ChatChunk {
+        id: "stream-id".into(),
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "public".into(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: AssistantDelta {
+                role: Some("assistant"),
+                content: Some(content.into()),
+                tool_calls: vec![],
+            },
+            finish_reason: None,
+        }],
+        usage: None,
+    }
+}
+
+fn terminal_chunk() -> ChatChunk {
+    ChatChunk {
+        id: "stream-id".into(),
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "public".into(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: AssistantDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+        }],
+        usage: None,
+    }
+}
+
+#[test]
+fn streaming_buffers_the_first_canonical_chunk_then_fails_over_once_per_precommit_error() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = [
+        StreamOutcome::SetupError(TargetError::connection()),
+        // A terminal-only native stream is represented at the provider seam
+        // by an exhausted canonical iterator.
+        StreamOutcome::Events(vec![]),
+        StreamOutcome::Events(vec![Err(TargetError::invalid_response())]),
+        StreamOutcome::Events(vec![Ok(canonical_chunk("chosen")), Ok(terminal_chunk())]),
+    ];
+    let targets = (0..outcomes.len())
+        .map(|index| target(&format!("entry-{index}")))
+        .collect();
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets,
+        }],
+    };
+    let next = Arc::new(AtomicUsize::new(0));
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new({
+            let seen = seen.clone();
+            move |target| {
+                seen.lock().unwrap().push(target.model_suffix);
+                let index = next.fetch_add(1, Ordering::AcqRel);
+                Box::new(SequencedStreamProvider(outcomes[index].clone()))
+            }
+        }),
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.header_values("content-type").collect::<Vec<_>>(),
+        vec!["text/event-stream"]
+    );
+    assert_eq!(
+        response.header_values("cache-control").collect::<Vec<_>>(),
+        vec!["no-cache"]
+    );
+    let body = std::str::from_utf8(&response.body).unwrap();
+    assert_eq!(body.matches("\"content\":\"chosen\"").count(), 1);
+    assert!(body.ends_with("data: [DONE]\n\n"));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["entry-0", "entry-1", "entry-2", "entry-3"]
+    );
+}
+
+#[test]
+fn committed_stream_failure_never_falls_back_or_invents_done() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("locked"), target("must-not-start")],
+        }],
+    };
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new({
+            let seen = seen.clone();
+            move |target| {
+                seen.lock().unwrap().push(target.model_suffix.clone());
+                if target.model_suffix == "locked" {
+                    Box::new(SequencedStreamProvider(StreamOutcome::Events(vec![
+                        Ok(canonical_chunk("partial")),
+                        Err(TargetError::connection()),
+                    ])))
+                } else {
+                    Box::new(SequencedStreamProvider(StreamOutcome::Events(vec![
+                        Ok(canonical_chunk("wrong-provider")),
+                        Ok(terminal_chunk()),
+                    ])))
+                }
+            }
+        }),
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    assert_eq!(response.status, 200);
+    assert_eq!(*seen.lock().unwrap(), vec!["locked"]);
+    assert!(std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("partial"));
+    assert!(!response.body.ends_with(b"data: [DONE]\n\n"));
+}
+
+#[test]
+fn committed_stream_without_terminal_closes_without_done() {
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("only")],
+        }],
+    };
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new(|_| {
+            Box::new(SequencedStreamProvider(StreamOutcome::Events(vec![Ok(
+                canonical_chunk("partial"),
+            )])))
+        }),
+    );
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    assert_eq!(response.status, 200);
+    assert!(!response.body.ends_with(b"data: [DONE]\n\n"));
+}
+
+#[test]
+fn post_commit_disconnect_drops_stream_and_releases_generation_permit() {
+    struct CancelOnNext {
+        cancellation: nano_llm::DownstreamCancellation,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Iterator for CancelOnNext {
+        type Item = Result<ChatChunk, TargetError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.cancellation.cancel();
+            Some(Ok(terminal_chunk()))
+        }
+    }
+    impl Drop for CancelOnNext {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    struct DisconnectProvider {
+        cancellation: nano_llm::DownstreamCancellation,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Provider for DisconnectProvider {
+        fn complete<'a>(
+            &'a self,
+            _request: &'a CanonicalRequest,
+        ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+            Box::pin(async { Ok(successful_response(FinishReason::Stop)) })
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _request: &'a CanonicalRequest,
+        ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+            let stream = CancelOnNext {
+                cancellation: self.cancellation.clone(),
+                dropped: self.dropped.clone(),
+            };
+            Box::pin(async move {
+                Ok(
+                    Box::new(std::iter::once(Ok(canonical_chunk("first"))).chain(stream))
+                        as ProviderStream,
+                )
+            })
+        }
+    }
+    let cancellation = nano_llm::DownstreamCancellation::default();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            max_in_flight: 1,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("only")],
+        }],
+    };
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new({
+            let cancellation = cancellation.clone();
+            let dropped = dropped.clone();
+            move |_| {
+                Box::new(DisconnectProvider {
+                    cancellation: cancellation.clone(),
+                    dropped: dropped.clone(),
+                })
+            }
+        }),
+    );
+    let response = application.handle(
+        &chat(
+            br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        )
+        .with_downstream_cancellation(cancellation),
+    );
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(!response.body.ends_with(b"data: [DONE]\n\n"));
+    // The materialized response has dropped its permit even though the stream
+    // was cancelled after the 200 commitment.
+    assert_eq!(
+        application
+            .handle(&chat(
+                br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .status,
+        200
+    );
+}
+
+#[test]
+fn downstream_cancellation_drops_active_provider_work() {
+    struct PendingUntilDropped {
+        cancellation: nano_llm::DownstreamCancellation,
+        dropped: Arc<AtomicBool>,
+    }
+    impl std::future::Future for PendingUntilDropped {
+        type Output = Result<ChatResponse, TargetError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.cancellation.cancel();
+            std::task::Poll::Pending
+        }
+    }
+    impl Drop for PendingUntilDropped {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    struct PendingProvider {
+        cancellation: nano_llm::DownstreamCancellation,
+        dropped: Arc<AtomicBool>,
+        pending: bool,
+    }
+    impl Provider for PendingProvider {
+        fn complete<'a>(
+            &'a self,
+            _request: &'a CanonicalRequest,
+        ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+            if self.pending {
+                Box::pin(PendingUntilDropped {
+                    cancellation: self.cancellation.clone(),
+                    dropped: self.dropped.clone(),
+                })
+            } else {
+                Box::pin(async { Ok(successful_response(FinishReason::Stop)) })
+            }
+        }
+
+        fn complete_stream<'a>(
+            &'a self,
+            _request: &'a CanonicalRequest,
+        ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+            Box::pin(async { Err(TargetError::invalid_response()) })
+        }
+    }
+
+    let cancellation = nano_llm::DownstreamCancellation::default();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let cancellation_for_factory = cancellation.clone();
+    let dropped_for_factory = dropped.clone();
+    let started = Arc::new(AtomicUsize::new(0));
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("first"), target("must-not-start")],
+        }],
+    };
+    let application = app_with_provider_factory(
+        config,
+        true,
+        Arc::new({
+            let started = started.clone();
+            move |_| {
+                let pending = started.fetch_add(1, Ordering::AcqRel) == 0;
+                Box::new(PendingProvider {
+                    cancellation: cancellation_for_factory.clone(),
+                    dropped: dropped_for_factory.clone(),
+                    pending,
+                })
+            }
+        }),
+    );
+
+    let response = application.handle(
+        &chat(br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#)
+            .with_downstream_cancellation(cancellation),
+    );
+    assert_eq!(response.status, 502);
+    assert!(dropped.load(Ordering::Acquire));
+    assert_eq!(
+        started.load(Ordering::Acquire),
+        1,
+        "fallback must not begin"
+    );
+    // The cancelled request's permit was released, so a new request can use
+    // the sole capacity slot and complete.
+    assert_eq!(
+        application
+            .handle(&chat(
+                br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .status,
+        200
+    );
+}
+
+#[test]
+fn route_diagnostics_are_complete_and_cannot_contain_upstream_canaries() {
+    let secret = "upstream-body-and-credential-canary";
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let dispatch_app = sequenced_application(
+        vec![
+            SequencedOutcome::Failure(TargetError::from_upstream_status(503)),
+            SequencedOutcome::Success(successful_response(FinishReason::Stop)),
+        ],
+        seen,
+    );
+    let route = RuntimeRoute {
+        model_name: "public".into(),
+        targets: vec![
+            RuntimeTarget {
+                api_key: Some(nano_llm::SecretString::new(secret.into())),
+                ..target("first")
+            },
+            target("second"),
+        ],
+    };
+    let canonical = nano_llm::decode_chat_request(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    )
+    .unwrap();
+
+    let dispatch = dispatch_app
+        .dispatch_route(
+            &route,
+            &canonical,
+            &nano_llm::DownstreamCancellation::default(),
+        )
+        .unwrap();
+    let diagnostics = dispatch.diagnostics;
+    assert_eq!(diagnostics.requested_model, "public");
+    assert_eq!(
+        diagnostics.selected_provider,
+        Some(nano_llm::ProviderKind::OpenAi)
+    );
+    assert_eq!(diagnostics.selected_model.as_deref(), Some("openai/second"));
+    assert_eq!(diagnostics.attempt_count, 2);
+    assert_eq!(diagnostics.error_kind, None);
+    assert_eq!(diagnostics.upstream_status, None);
+    assert!(!format!("{diagnostics:?}").contains(secret));
+
+    let response = application(
+        vec![target("only")],
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+        true,
+    )
+    .handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"upstream-body-and-credential-canary"}]}"#,
+    ));
+    assert!(!String::from_utf8(response.body).unwrap().contains(secret));
+}
+
+#[test]
+fn request_logs_are_complete_safe_and_include_safe_attempt_diagnostics() {
+    let canary = "body-credential-authorization-canary";
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(capture.clone())
+        .finish();
+    let response = tracing::subscriber::with_default(subscriber, || {
+        // Parallel tests may previously have evaluated these callsites under
+        // the no-op dispatcher. Refresh them after this scoped capture is
+        // active so this test observes the application's completion record.
+        tracing::callsite::rebuild_interest_cache();
+        application(
+            vec![target("first"), target("fallback")],
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            true,
+        )
+        .handle(
+            &chat(
+                format!(
+                    r#"{{"model":"public","messages":[{{"role":"user","content":"{canary}"}}]}}"#
+                )
+                .into_bytes(),
+            )
+            .with_header("authorization", format!("Bearer {canary}"))
+            .with_header("x-request-id", "log-id"),
+        )
+    });
+    assert_eq!(response.status, 502);
+
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("request_completed").count(), 1);
+    assert!(logs.contains("request_id=log-id"));
+    assert!(logs.contains("outcome=upstream_exhausted"));
+    assert!(logs.contains("status=502"));
+    assert!(logs.contains("requested_model=public"));
+    assert!(logs.contains("selected_provider=openai"));
+    assert!(logs.contains("selected_model=openai/fallback"));
+    assert!(logs.contains("attempt_count=2"));
+    assert_eq!(logs.matches("attempt_failed").count(), 2);
+    assert!(!logs.contains(canary));
+
+    let health_capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_writer(health_capture.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        application(
+            vec![target("only")],
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            false,
+        )
+        .handle(&HttpRequest::new("GET", "/health").with_header("x-request-id", "health-log"));
+    });
+    let health_logs = String::from_utf8(health_capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(health_logs.matches("request_completed").count(), 1);
+    assert!(health_logs.contains("requested_model=null"));
+    assert!(health_logs.contains("selected_provider=null"));
+    assert!(health_logs.contains("selected_model=null"));
+    assert!(health_logs.contains("attempt_count=null"));
+}
+
+#[derive(Default)]
+struct PausedClock(AtomicU64);
+
+impl PausedClock {
+    fn advance(&self, duration: Duration) {
+        self.0.fetch_add(duration.as_secs(), Ordering::AcqRel);
+    }
+}
+
+impl nano_llm::MonotonicClock for PausedClock {
+    fn now(&self) -> Duration {
+        Duration::from_secs(self.0.load(Ordering::Acquire))
+    }
+}
+
+struct TimedPostCommitStream {
+    clock: Arc<PausedClock>,
+    delays: Vec<Duration>,
+    events: Vec<Result<ChatChunk, TargetError>>,
+}
+
+impl Iterator for TimedPostCommitStream {
+    type Item = Result<ChatChunk, TargetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let delay = self.delays.first().copied()?;
+        self.delays.remove(0);
+        self.clock.advance(delay);
+        Some(self.events.remove(0))
+    }
+}
+
+struct TimedPostCommitProvider {
+    clock: Arc<PausedClock>,
+    delays: Vec<Duration>,
+    events: Vec<Result<ChatChunk, TargetError>>,
+}
+
+impl Provider for TimedPostCommitProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        let stream = TimedPostCommitStream {
+            clock: self.clock.clone(),
+            delays: self.delays.clone(),
+            events: self.events.clone(),
+        };
+        Box::pin(async move { Ok(Box::new(stream) as ProviderStream) })
+    }
+}
+
+#[test]
+fn post_commit_idle_deadline_resets_only_when_a_canonical_chunk_is_emitted() {
+    let clock = Arc::new(PausedClock::default());
+    let mut selected = target("timed");
+    selected.timeout = 3;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![selected],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            move |_| {
+                Box::new(TimedPostCommitProvider {
+                    clock: clock.clone(),
+                    // Each ordinary chunk arrives before the 3-second idle
+                    // deadline and resets it; the terminal then completes.
+                    delays: vec![
+                        Duration::ZERO,
+                        Duration::from_secs(2),
+                        Duration::from_secs(2),
+                    ],
+                    events: vec![
+                        Ok(canonical_chunk("first")),
+                        Ok(canonical_chunk("progress")),
+                        Ok(terminal_chunk()),
+                    ],
+                })
+            }
+        }),
+        clock,
+    );
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    let body = std::str::from_utf8(&response.body).unwrap();
+    assert!(body.contains("progress"));
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
+
+#[test]
+fn post_commit_idle_timeout_closes_locked_stream_without_done_or_fallback() {
+    let clock = Arc::new(PausedClock::default());
+    let seen = Arc::new(AtomicUsize::new(0));
+    let mut selected = target("timed");
+    selected.timeout = 3;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings::default(),
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![selected, target("must-not-start")],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            let seen = seen.clone();
+            move |_| {
+                seen.fetch_add(1, Ordering::AcqRel);
+                Box::new(TimedPostCommitProvider {
+                    clock: clock.clone(),
+                    delays: vec![Duration::ZERO, Duration::from_secs(3)],
+                    events: vec![
+                        Ok(canonical_chunk("first")),
+                        Ok(canonical_chunk("too-late")),
+                    ],
+                })
+            }
+        }),
+        clock,
+    );
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    assert_eq!(seen.load(Ordering::Acquire), 1);
+    assert!(std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("first"));
+    assert!(!std::str::from_utf8(&response.body)
+        .unwrap()
+        .contains("too-late"));
+    assert!(!response.body.ends_with(b"data: [DONE]\n\n"));
+}
+
+struct PendingThroughDeadline {
+    clock: Arc<PausedClock>,
+    advance: Duration,
+    dropped: Arc<AtomicBool>,
+}
+
+impl std::future::Future for PendingThroughDeadline {
+    type Output = Result<ChatResponse, TargetError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.clock.advance(self.advance);
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for PendingThroughDeadline {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+struct DeadlineProvider {
+    clock: Arc<PausedClock>,
+    advance: Option<Duration>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Provider for DeadlineProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        match self.advance {
+            Some(advance) => Box::pin(PendingThroughDeadline {
+                clock: self.clock.clone(),
+                advance,
+                dropped: self.dropped.clone(),
+            }),
+            None => Box::pin(async { Ok(successful_response(FinishReason::Stop)) }),
+        }
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+}
+
+#[test]
+fn attempt_timeout_uses_resolved_target_timeout_cancels_work_and_advances() {
+    let clock = Arc::new(PausedClock::default());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let invoked = Arc::new(Mutex::new(Vec::new()));
+    let mut first = target("per-target");
+    first.timeout = 3;
+    first.explicit_timeout = Some(3);
+    let mut second = target("global-default");
+    // Runtime configuration resolves absent target overrides to this global
+    // value before routing constructs an adapter.
+    second.timeout = 7;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            request_timeout: 7,
+            overall_timeout: 10,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![first, second],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            let dropped = dropped.clone();
+            let invoked = invoked.clone();
+            move |target| {
+                invoked
+                    .lock()
+                    .unwrap()
+                    .push((target.model_suffix.clone(), target.timeout));
+                Box::new(DeadlineProvider {
+                    clock: clock.clone(),
+                    advance: (target.model_suffix == "per-target").then(|| Duration::from_secs(3)),
+                    dropped: dropped.clone(),
+                })
+            }
+        }),
+        clock.clone(),
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        *invoked.lock().unwrap(),
+        vec![("per-target".into(), 3), ("global-default".into(), 7)]
+    );
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "attempt expiry must drop active upstream work"
+    );
+}
+
+#[test]
+fn overall_deadline_clips_attempt_returns_exact_504_and_never_starts_fallback() {
+    let clock = Arc::new(PausedClock::default());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let mut first = target("long");
+    first.timeout = 10;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            overall_timeout: 5,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![first, target("never")],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            let dropped = dropped.clone();
+            let invoked = invoked.clone();
+            move |_| {
+                invoked.fetch_add(1, Ordering::AcqRel);
+                Box::new(DeadlineProvider {
+                    clock: clock.clone(),
+                    advance: Some(Duration::from_secs(5)),
+                    dropped: dropped.clone(),
+                })
+            }
+        }),
+        clock,
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#,
+    ));
+    assert_eq!(response.status, 504);
+    assert_eq!(response.body, br#"{"error":{"message":"Overall request timed out","type":"server_error","param":null,"code":"overall_timeout"}}"#);
+    assert_eq!(invoked.load(Ordering::Acquire), 1);
+    assert!(dropped.load(Ordering::Acquire));
+}
+
+struct ChunkAfterDeadline {
+    clock: Arc<PausedClock>,
+    emitted: bool,
+}
+
+impl Iterator for ChunkAfterDeadline {
+    type Item = Result<ChatChunk, TargetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.emitted {
+            return None;
+        }
+        self.emitted = true;
+        self.clock.advance(Duration::from_secs(5));
+        Some(Ok(canonical_chunk("too-late")))
+    }
+}
+
+struct FirstChunkDeadlineProvider {
+    clock: Arc<PausedClock>,
+}
+
+impl Provider for FirstChunkDeadlineProvider {
+    fn complete<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ChatResponse, TargetError>> {
+        Box::pin(async { Err(TargetError::invalid_response()) })
+    }
+
+    fn complete_stream<'a>(
+        &'a self,
+        _request: &'a CanonicalRequest,
+    ) -> ProviderFuture<'a, Result<ProviderStream, TargetError>> {
+        let clock = self.clock.clone();
+        Box::pin(async move {
+            Ok(Box::new(ChunkAfterDeadline {
+                clock,
+                emitted: false,
+            }) as ProviderStream)
+        })
+    }
+}
+
+#[test]
+fn streaming_first_chunk_deadline_uses_overall_timeout_precedence() {
+    let clock = Arc::new(PausedClock::default());
+    let invoked = Arc::new(AtomicUsize::new(0));
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            overall_timeout: 5,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![target("late"), target("must-not-run")],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            let invoked = invoked.clone();
+            move |_| {
+                invoked.fetch_add(1, Ordering::AcqRel);
+                Box::new(FirstChunkDeadlineProvider {
+                    clock: clock.clone(),
+                })
+            }
+        }),
+        clock,
+    );
+
+    let response = application.handle(&chat(
+        br#"{"model":"public","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+    ));
+    assert_eq!(response.status, 504);
+    assert_eq!(invoked.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn simultaneous_attempt_and_overall_expiry_is_classified_as_overall_timeout() {
+    let clock = Arc::new(PausedClock::default());
+    let mut only = target("tie");
+    only.timeout = 5;
+    let config = RuntimeConfig {
+        general_settings: RuntimeGeneralSettings {
+            overall_timeout: 5,
+            ..RuntimeGeneralSettings::default()
+        },
+        routes: vec![RuntimeRoute {
+            model_name: "public".into(),
+            targets: vec![only],
+        }],
+    };
+    let application = app_with_provider_factory_and_clock(
+        config,
+        true,
+        Arc::new({
+            let clock = clock.clone();
+            move |_| {
+                Box::new(DeadlineProvider {
+                    clock: clock.clone(),
+                    advance: Some(Duration::from_secs(5)),
+                    dropped: Arc::new(AtomicBool::new(false)),
+                })
+            }
+        }),
+        clock,
+    );
+
+    assert_eq!(
+        application
+            .handle(&chat(
+                br#"{"model":"public","messages":[{"role":"user","content":"hello"}]}"#
+            ))
+            .status,
+        504
+    );
+}

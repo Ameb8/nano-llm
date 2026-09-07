@@ -84,12 +84,7 @@ fn is_plain_non_string(s: &str) -> Option<&'static str> {
     {
         return Some("integer");
     }
-    // Decimal integers
-    let digits = s
-        .strip_prefix('+')
-        .or_else(|| s.strip_prefix('-'))
-        .unwrap_or(s);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+    if is_yaml_decimal_integer(s) {
         return Some("integer");
     }
     // Float constants (.nan, .inf)
@@ -104,10 +99,30 @@ fn is_plain_non_string(s: &str) -> Option<&'static str> {
         return Some("float");
     }
     // Numbers with decimal point or scientific notation
-    if (s.contains('.') || s.contains('e') || s.contains('E')) && s.parse::<f64>().is_ok() {
+    if (s.contains('.') || s.contains('e') || s.contains('E'))
+        && s.replace('_', "").parse::<f64>().is_ok()
+    {
         return Some("float");
     }
     None
+}
+
+/// Returns whether a scalar uses the accepted decimal YAML-integer spelling.
+///
+/// YAML permits `_` as a digit separator. Keeping this check separate from
+/// Rust's number parser avoids accidentally treating an integral-looking float
+/// (for example `30.0` or `3e1`) as an integer during deserialization.
+fn is_yaml_decimal_integer(s: &str) -> bool {
+    let digits = s
+        .strip_prefix('+')
+        .or_else(|| s.strip_prefix('-'))
+        .unwrap_or(s);
+    !digits.is_empty()
+        && !digits.starts_with('_')
+        && !digits.ends_with('_')
+        && digits
+            .split('_')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
 struct YamlStream<'a> {
@@ -139,10 +154,7 @@ impl<'a> YamlStream<'a> {
                         message: info.to_string(),
                     }
                 };
-                Err(ConfigError::new(
-                    kind,
-                    Some(marker_to_location(marker)),
-                ))
+                Err(ConfigError::new(kind, Some(marker_to_location(marker))))
             }
             None => Ok(None),
         }
@@ -210,21 +222,12 @@ pub fn parse_spanned_node(yaml: &str) -> Result<SpannedNode, ConfigError> {
     };
 
     // Check for any subsequent documents
-    loop {
-        match stream.next()? {
-            Some((Event::StreamEnd, _)) | None => break,
-            Some((Event::DocumentStart(_), span)) => {
-                return Err(ConfigError::new(
-                    ConfigErrorKind::MultipleDocuments,
-                    Some(marker_to_location(&span.start)),
-                ));
-            }
-            Some((_, span)) => {
-                return Err(ConfigError::new(
-                    ConfigErrorKind::MultipleDocuments,
-                    Some(marker_to_location(&span.start)),
-                ));
-            }
+    if let Some((event, span)) = stream.next()? {
+        if event != Event::StreamEnd {
+            return Err(ConfigError::new(
+                ConfigErrorKind::MultipleDocuments,
+                Some(marker_to_location(&span.start)),
+            ));
         }
     }
 
@@ -589,10 +592,7 @@ fn parse_model_entry(node: &SpannedNode, path: &str) -> Result<RawModelEntry, Co
     })
 }
 
-fn parse_litellm_params(
-    node: &SpannedNode,
-    path: &str,
-) -> Result<RawLiteLlmParams, ConfigError> {
+fn parse_litellm_params(node: &SpannedNode, path: &str) -> Result<RawLiteLlmParams, ConfigError> {
     let entries = match node {
         SpannedNode::Mapping { entries, .. } => entries,
         _ => {
@@ -749,16 +749,11 @@ fn parse_string(node: &SpannedNode, path: &str) -> Result<String, ConfigError> {
     }
 }
 
-fn parse_optional_string(
-    node: &SpannedNode,
-    path: &str,
-) -> Result<Option<String>, ConfigError> {
+fn parse_optional_string(node: &SpannedNode, path: &str) -> Result<Option<String>, ConfigError> {
     match node {
         SpannedNode::Scalar { value, style, .. } => {
             if *style == ScalarStyle::Plain
-                && (value == "~"
-                    || value.eq_ignore_ascii_case("null")
-                    || value.is_empty())
+                && (value == "~" || value.eq_ignore_ascii_case("null") || value.is_empty())
             {
                 Ok(None)
             } else if *style == ScalarStyle::Plain && is_plain_non_string(value).is_some() {
@@ -786,26 +781,28 @@ fn parse_optional_string(
     }
 }
 
-fn parse_optional_number(
-    node: &SpannedNode,
-    path: &str,
-) -> Result<Option<f64>, ConfigError> {
+fn parse_optional_number(node: &SpannedNode, path: &str) -> Result<Option<f64>, ConfigError> {
     match node {
         SpannedNode::Scalar { value, style, .. } => {
-            if *style == ScalarStyle::Plain
-                && (value == "~"
-                    || value.eq_ignore_ascii_case("null")
-                    || value.is_empty())
-            {
-                Ok(None)
-            } else if let Ok(num) = value.parse::<f64>() {
+            if *style == ScalarStyle::Plain && is_yaml_decimal_integer(value) {
+                // `_` is legal YAML integer syntax but not Rust numeric syntax.
+                let num = value.replace('_', "").parse::<f64>().map_err(|_| {
+                    ConfigError::new(
+                        ConfigErrorKind::InvalidType {
+                            path: path.to_string(),
+                            expected: "integer",
+                            found: value.clone(),
+                        },
+                        Some(node.location()),
+                    )
+                })?;
                 if num.is_finite() {
                     Ok(Some(num))
                 } else {
                     Err(ConfigError::new(
                         ConfigErrorKind::InvalidType {
                             path: path.to_string(),
-                            expected: "finite number",
+                            expected: "integer",
                             found: value.clone(),
                         },
                         Some(node.location()),
@@ -815,7 +812,7 @@ fn parse_optional_number(
                 Err(ConfigError::new(
                     ConfigErrorKind::InvalidType {
                         path: path.to_string(),
-                        expected: "number",
+                        expected: "integer",
                         found: value.clone(),
                     },
                     Some(node.location()),
@@ -833,20 +830,23 @@ fn parse_optional_number(
     }
 }
 
-fn parse_optional_integer(
-    node: &SpannedNode,
-    path: &str,
-) -> Result<Option<usize>, ConfigError> {
+fn parse_optional_integer(node: &SpannedNode, path: &str) -> Result<Option<usize>, ConfigError> {
     match node {
         SpannedNode::Scalar { value, style, .. } => {
-            if *style == ScalarStyle::Plain
-                && (value == "~"
-                    || value.eq_ignore_ascii_case("null")
-                    || value.is_empty())
-            {
-                Ok(None)
-            } else if let Ok(num) = value.parse::<usize>() {
-                Ok(Some(num))
+            if *style == ScalarStyle::Plain && is_yaml_decimal_integer(value) {
+                let normalized = value.replace('_', "");
+                if let Ok(num) = normalized.parse::<usize>() {
+                    Ok(Some(num))
+                } else {
+                    Err(ConfigError::new(
+                        ConfigErrorKind::InvalidType {
+                            path: path.to_string(),
+                            expected: "integer",
+                            found: value.clone(),
+                        },
+                        Some(node.location()),
+                    ))
+                }
             } else {
                 Err(ConfigError::new(
                     ConfigErrorKind::InvalidType {

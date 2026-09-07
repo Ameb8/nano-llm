@@ -1,0 +1,26 @@
+# Example nano-llm configuration.
+#
+# Set the referenced environment variables before starting the gateway:
+#   export LITELLM_MASTER_KEY=...
+#   export MISTRAL_API_KEY=...
+#   export GEMINI_API_KEY=...
+
+model_list:
+  # Entries with the same model_name are tried in file order. Here, Gemini is
+  # used only when the Mistral target fails before producing a response.
+  - model_name: mistral-fast
+    litellm_params:
+      model: mistral/mistral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+
+  - model_name: gemini-fast
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+general_settings:
+  # Clients present this value as: Authorization: Bearer <master key>
+  master_key: os.environ/LITELLM_MASTER_KEY
+  request_timeout: 30
+  overall_timeout: 120
+  max_in_flight: 64

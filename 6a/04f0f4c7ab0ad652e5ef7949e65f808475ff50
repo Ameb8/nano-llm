@@ -1,0 +1,60 @@
+docs/backlog/agent-and-platform-services.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/vertex-ai.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/embeddings-and-additional-endpoints.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/guardrails.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/provider-health.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/multi-tenant-access-control.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/adaptive-routing.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/provider-expansion.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/responses-api.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/response-caching.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/modern-request-features.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/secret-manager-integrations.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/observability-and-cost-visibility.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/configuration-reload.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/budgets-rate-limits-and-spend.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+docs/backlog/release-and-distribution.md
+  s_82d95af5f2e466::t_c0acab6cbb5ffa 1-4,7-15
+  s_82d95af5f2e466::t_cf8ca9dd8ca4bc 5-6
+docs/backlog/admin-dashboard.md
+  s_1a3d4c9a43fe26::t_18a1254580c6b5 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.4.12",
+  "base_commit_sha": "6a04f0f4c7ab0ad652e5ef7949e65f808475ff50",
+  "prompts": {},
+  "sessions": {
+    "s_1a3d4c9a43fe26": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07fde-1eec-7f01-af00-59189c8deeeb",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Alex Buckley <alexmeb81@outlook.com>"
+    },
+    "s_82d95af5f2e466": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a07ff7-0b8f-7512-9001-e6766a8f1994",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Alex Buckley <alexmeb81@outlook.com>"
+    }
+  }
+}

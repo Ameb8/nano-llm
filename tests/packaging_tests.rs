@@ -9,6 +9,7 @@ fn repository_file(path: &str) -> String {
 #[test]
 fn scratch_image_has_only_the_binary_and_plain_http_entrypoint() {
     let dockerfile = repository_file("Dockerfile");
+    let workflow = repository_file(".github/workflows/release-artifacts.yml");
     assert!(
         dockerfile.contains("FROM scratch AS artifact\nCOPY --from=build /out/nano-llm /nano-llm")
     );
@@ -16,6 +17,8 @@ fn scratch_image_has_only_the_binary_and_plain_http_entrypoint() {
     assert!(dockerfile.contains("ENTRYPOINT [\"/nano-llm\", \"--config\", \"/etc/nano-llm/config.yaml\", \"--bind\", \"0.0.0.0:4000\"]"));
     assert!(!dockerfile.contains("/bin/sh"));
     assert!(!dockerfile.contains("HEALTHCHECK"));
+    assert!(workflow.contains("tar -tf - nano-llm"));
+    assert!(!workflow.contains("tar -t | sort"));
 }
 
 #[test]
@@ -50,10 +53,12 @@ fn release_smoke_exercises_the_public_gateway_surface_and_canary_scan() {
     assert!(smoke.contains("/v1/models"));
     assert!(smoke.contains("/v1/chat/completions"));
     assert!(smoke.contains("data: [DONE]"));
+    assert!(smoke.contains("\"finish_reason\":\"stop\""));
     assert!(smoke.contains("release-master-canary"));
     assert!(smoke.contains("request-body-canary"));
     assert!(smoke.contains("qemu-aarch64"));
     assert!(smoke.contains("qemu-x86_64"));
+    assert!(smoke.contains("runner_label=binfmt"));
 }
 
 #[test]

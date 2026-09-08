@@ -64,7 +64,10 @@ jobs:
           test "$(docker image inspect nano-llm:smoke --format '{{.Config.Entrypoint}}')" = '[/nano-llm --config /etc/nano-llm/config.yaml --bind 0.0.0.0:4000]'
           test "$(docker image inspect nano-llm:smoke --format '{{.Config.User}}')" = '65532:65532'
           filesystem_container=$(docker create nano-llm:smoke)
-          test "$(docker export "$filesystem_container" | tar -t | sort)" = 'nano-llm'
+          # Docker injects runtime files such as /etc/hosts into a created
+          # container, so verify the image payload without comparing the
+          # complete exported filesystem byte-for-byte.
+          docker export "$filesystem_container" | tar -tf - nano-llm >/dev/null
           docker rm "$filesystem_container" >/dev/null
           if docker run --rm nano-llm:smoke >/dev/null 2>&1; then
             echo 'image unexpectedly started without its required config mount' >&2

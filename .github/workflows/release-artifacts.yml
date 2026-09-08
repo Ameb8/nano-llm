@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: task executable-matrix
+      - run: cargo test --features executable-test-tls --test executable_matrix_tests -- --test-threads=1
 
   static-artifact:
     strategy:

@@ -24,12 +24,23 @@ fn release_builds_both_static_linux_architectures() {
     let verifier = repository_file("scripts/verify-static-artifact.sh");
     assert!(dockerfile.contains("x86_64-unknown-linux-musl"));
     assert!(dockerfile.contains("aarch64-unknown-linux-musl"));
+    assert!(dockerfile.contains("apt-get install --yes --no-install-recommends musl-tools"));
+    assert!(dockerfile.contains("CC=musl-gcc"));
     assert!(dockerfile.contains("target-feature=+crt-static"));
     assert!(dockerfile.contains("cargo build --locked --release"));
     assert!(verifier.contains("static-pie linked"));
     assert!(verifier.contains("Requesting program interpreter"));
     assert!(verifier.contains("(NEEDED)"));
     assert!(verifier.contains("--help"));
+}
+
+#[test]
+fn executable_matrix_ci_does_not_assume_task_is_preinstalled() {
+    let workflow = repository_file(".github/workflows/release-artifacts.yml");
+    assert!(!workflow.contains("run: task executable-matrix"));
+    assert!(workflow.contains(
+        "run: cargo test --features executable-test-tls --test executable_matrix_tests -- --test-threads=1"
+    ));
 }
 
 #[test]

@@ -111,6 +111,20 @@ HTTP client. Probe its plain `http://…/health` listener externally. nano-llm
 does not provide inbound TLS, certificates, or ACME; outbound provider HTTPS
 uses bundled trust roots.
 
+Before pushing a release-related change, reproduce every job in the
+`release-artifacts` workflow locally:
+
+```bash
+docker buildx inspect --bootstrap
+task ci-release
+```
+
+The Buildx platform list must include both `linux/amd64` and `linux/arm64`.
+`task ci-release` runs the executable provider matrix, builds and smoke-tests
+both static artifacts, then builds and smoke-tests the scratch runtime image.
+It requires Docker Buildx plus native, QEMU, or `binfmt_misc` execution for
+both architectures.
+
 To collect an idle-memory qualification sample from a release artifact, run:
 
 ```bash
@@ -160,3 +174,4 @@ All `/v1/*` errors use an OpenAI-shaped JSON envelope. The gateway never forward
 - `task lint` — runs Clippy with warnings treated as errors (`cargo clippy --all-targets --all-features -- -D warnings`)
 - `task test` — executes the automated test suite (`cargo test --all-targets --all-features`)
 - `task check` — runs format verification, linting, and tests; fails if any constituent check fails
+- `task ci-release` — reproduces all release-artifact CI jobs locally

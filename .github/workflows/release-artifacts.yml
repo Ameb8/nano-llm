@@ -7,17 +7,24 @@ on:
       - Cargo.lock
       - Cargo.toml
       - Dockerfile
+      - Taskfile.yml
       - .github/workflows/release-artifacts.yml
+      - rust-toolchain.toml
+      - scripts/smoke-release-artifact.sh
+      - scripts/smoke-runtime-image.sh
       - scripts/verify-static-artifact.sh
       - src/**
+      - tests/**
 
 jobs:
   executable-matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
       - run: cargo test --features executable-test-tls --test executable_matrix_tests -- --test-threads=1
 
   static-artifact:
@@ -29,7 +36,7 @@ jobs:
             architecture: x86_64
           - platform: linux/arm64
             architecture: aarch64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -49,7 +56,7 @@ jobs:
           if-no-files-found: error
 
   scratch-runtime:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -58,29 +65,4 @@ jobs:
           context: .
           load: true
           tags: nano-llm:smoke
-      - shell: bash
-        run: |
-          set -euo pipefail
-          test "$(docker image inspect nano-llm:smoke --format '{{.Config.Entrypoint}}')" = '[/nano-llm --config /etc/nano-llm/config.yaml --bind 0.0.0.0:4000]'
-          test "$(docker image inspect nano-llm:smoke --format '{{.Config.User}}')" = '65532:65532'
-          filesystem_container=$(docker create nano-llm:smoke)
-          # Docker injects runtime files such as /etc/hosts into a created
-          # container, so verify the image payload without comparing the
-          # complete exported filesystem byte-for-byte.
-          docker export "$filesystem_container" | tar -tf - nano-llm >/dev/null
-          docker rm "$filesystem_container" >/dev/null
-          if docker run --rm nano-llm:smoke >/dev/null 2>&1; then
-            echo 'image unexpectedly started without its required config mount' >&2
-            exit 1
-          fi
-          workdir=$(mktemp -d)
-          trap 'docker rm -f nano-llm-smoke >/dev/null 2>&1 || true; rm -rf "$workdir"' EXIT
-          printf '%s\n' 'model_list:' '  - model_name: local' '    litellm_params:' '      model: openai_compatible/test' '      api_base: http://127.0.0.1:1/v1' 'general_settings:' '  master_key: os.environ/NANO_LLM_MASTER_KEY' > "$workdir/config.yaml"
-          if docker run --rm -v "$workdir/config.yaml:/etc/nano-llm/config.yaml:ro" nano-llm:smoke >/dev/null 2>&1; then
-            echo 'image unexpectedly started without the required secret variable' >&2
-            exit 1
-          fi
-          docker run -d --name nano-llm-smoke -p 127.0.0.1::4000 -v "$workdir/config.yaml:/etc/nano-llm/config.yaml:ro" -e NANO_LLM_MASTER_KEY=test-key nano-llm:smoke
-          for _ in {1..50}; do curl -fsS "http://$(docker port nano-llm-smoke 4000)/health" && exit 0; sleep .1; done
-          docker logs nano-llm-smoke
-          exit 1
+      - run: scripts/smoke-runtime-image.sh nano-llm:smoke

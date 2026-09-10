@@ -2,6 +2,7 @@
 target/
 **/*.rs.bk
 *.pdb
+dist/
 
 # Local environment and secret files
 .env

@@ -4,6 +4,9 @@ FROM --platform=$TARGETPLATFORM rust:${RUST_VERSION}-slim-bookworm AS build
 
 ARG TARGETARCH
 WORKDIR /src
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN case "$TARGETARCH" in \
@@ -12,7 +15,7 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported Linux architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac \
     && rustup target add "$rust_target" \
-    && SOURCE_DATE_EPOCH=0 RUSTFLAGS='-C target-feature=+crt-static -C strip=symbols --remap-path-prefix=/src=.' cargo build --locked --release --target "$rust_target" \
+    && CC=musl-gcc SOURCE_DATE_EPOCH=0 RUSTFLAGS='-C target-feature=+crt-static -C strip=symbols --remap-path-prefix=/src=.' cargo build --locked --release --target "$rust_target" \
     && mkdir /out \
     && cp "target/$rust_target/release/nano-llm" /out/nano-llm
 

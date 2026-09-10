@@ -42,7 +42,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404); return
         if request.get("stream"):
             body = ('data: {"id":"fixture","object":"chat.completion.chunk","created":0,'
-                    '"model":"private","choices":[{"index":0,"delta":{"content":"increment"},"finish_reason":null}]}\n\n'
+                    '"model":"private","choices":[{"index":0,"delta":{"content":"increment"},"finish_reason":"stop"}]}\n\n'
                     'data: [DONE]\n\n').encode()
             self.send_response(200); self.send_header("content-type", "text/event-stream")
         else:
@@ -68,12 +68,30 @@ general_settings:
   master_key: os.environ/NANO_LLM_SMOKE_MASTER
 EOF
 export NANO_LLM_SMOKE_MASTER=release-master-canary
+runner_label=native
 if [ "$(uname -m)" = "$host_machine" ]; then
     "$binary" --config "$workdir/config.yaml" --bind 127.0.0.1:40138 >"$workdir/gateway.log" 2>&1 &
 else
-    for candidate in $runner; do command -v "$candidate" >/dev/null 2>&1 && runner=$candidate && break; done
-    command -v "$runner" >/dev/null 2>&1 || { echo "no compatible runner for $architecture" >&2; exit 1; }
-    "$runner" "$binary" --config "$workdir/config.yaml" --bind 127.0.0.1:40138 >"$workdir/gateway.log" 2>&1 &
+    if "$binary" --help >/dev/null 2>&1; then
+        runner=''
+        runner_label=binfmt
+    else
+        selected_runner=''
+        for candidate in $runner; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                selected_runner=$candidate
+                break
+            fi
+        done
+        [ -n "$selected_runner" ] || { echo "no compatible runner for $architecture" >&2; exit 1; }
+        runner=$selected_runner
+        runner_label=$selected_runner
+    fi
+    if [ -n "$runner" ]; then
+        "$runner" "$binary" --config "$workdir/config.yaml" --bind 127.0.0.1:40138 >"$workdir/gateway.log" 2>&1 &
+    else
+        "$binary" --config "$workdir/config.yaml" --bind 127.0.0.1:40138 >"$workdir/gateway.log" 2>&1 &
+    fi
 fi
 gateway_pid=$!
 for _ in $(seq 1 50); do curl -fsS http://127.0.0.1:40138/health >"$workdir/health" 2>/dev/null && break; sleep .1; done
@@ -86,4 +104,4 @@ curl -fsS -N -H "Authorization: Bearer $NANO_LLM_SMOKE_MASTER" -H 'Content-Type:
 grep -q 'increment' "$workdir/stream"
 grep -qx 'data: \[DONE\]' "$workdir/stream"
 ! grep -R -F -e "$NANO_LLM_SMOKE_MASTER" -e request-body-canary -e stream-body-canary "$workdir/gateway.log" "$workdir/health" "$workdir/models" "$workdir/chat" "$workdir/stream"
-printf 'release_artifact_smoke=passed architecture=%s runner=%s\n' "$architecture" "${runner:-native}"
+printf 'release_artifact_smoke=passed architecture=%s runner=%s\n' "$architecture" "$runner_label"

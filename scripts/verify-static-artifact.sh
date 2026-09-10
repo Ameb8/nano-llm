@@ -24,13 +24,20 @@ if [ "$(uname -m)" = "$host_machine" ]; then
     "$binary" --help >/dev/null
 else
     runner=''
-    for candidate in $qemu; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            runner=$candidate
-            break
-        fi
-    done
-    if [ -n "$runner" ]; then
+    direct_execution=0
+    if "$binary" --help >/dev/null 2>&1; then
+        direct_execution=1
+    else
+        for candidate in $qemu; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                runner=$candidate
+                break
+            fi
+        done
+    fi
+    if [ "$direct_execution" = 1 ]; then
+        : # The host has transparent binfmt_misc execution for this architecture.
+    elif [ -n "$runner" ]; then
         "$runner" "$binary" --help >/dev/null
     elif [ "${NANO_LLM_REQUIRE_EXECUTION:-0}" = 1 ]; then
         echo "artifact inspection passed, but no compatible runner is available for $architecture" >&2

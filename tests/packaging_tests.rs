@@ -9,6 +9,7 @@ fn repository_file(path: &str) -> String {
 #[test]
 fn scratch_image_has_only_the_binary_and_plain_http_entrypoint() {
     let dockerfile = repository_file("Dockerfile");
+    let smoke = repository_file("scripts/smoke-runtime-image.sh");
     assert!(
         dockerfile.contains("FROM scratch AS artifact\nCOPY --from=build /out/nano-llm /nano-llm")
     );
@@ -16,6 +17,8 @@ fn scratch_image_has_only_the_binary_and_plain_http_entrypoint() {
     assert!(dockerfile.contains("ENTRYPOINT [\"/nano-llm\", \"--config\", \"/etc/nano-llm/config.yaml\", \"--bind\", \"0.0.0.0:4000\"]"));
     assert!(!dockerfile.contains("/bin/sh"));
     assert!(!dockerfile.contains("HEALTHCHECK"));
+    assert!(smoke.contains("tar -tf - nano-llm"));
+    assert!(!smoke.contains("tar -t | sort"));
 }
 
 #[test]
@@ -24,6 +27,8 @@ fn release_builds_both_static_linux_architectures() {
     let verifier = repository_file("scripts/verify-static-artifact.sh");
     assert!(dockerfile.contains("x86_64-unknown-linux-musl"));
     assert!(dockerfile.contains("aarch64-unknown-linux-musl"));
+    assert!(dockerfile.contains("apt-get install --yes --no-install-recommends musl-tools"));
+    assert!(dockerfile.contains("CC=musl-gcc"));
     assert!(dockerfile.contains("target-feature=+crt-static"));
     assert!(dockerfile.contains("cargo build --locked --release"));
     assert!(verifier.contains("static-pie linked"));
@@ -33,16 +38,75 @@ fn release_builds_both_static_linux_architectures() {
 }
 
 #[test]
+fn executable_matrix_ci_does_not_assume_task_is_preinstalled() {
+    let workflow = repository_file(".github/workflows/release-artifacts.yml");
+    assert!(!workflow.contains("run: task executable-matrix"));
+    assert!(workflow.contains(
+        "run: cargo test --features executable-test-tls --test executable_matrix_tests -- --test-threads=1"
+    ));
+}
+
+#[test]
+fn local_release_ci_covers_every_release_workflow_job() {
+    let taskfile = repository_file("Taskfile.yml");
+    assert!(taskfile.contains("  ci-release:"));
+    assert!(taskfile.contains("      - task: executable-matrix"));
+    assert!(taskfile.contains("      - task: release-linux"));
+    assert!(taskfile.contains("      - task: scratch-runtime"));
+}
+
+#[test]
+fn scratch_runtime_smoke_is_shared_by_ci_and_local_tasks() {
+    let workflow = repository_file(".github/workflows/release-artifacts.yml");
+    let taskfile = repository_file("Taskfile.yml");
+    let smoke = repository_file("scripts/smoke-runtime-image.sh");
+
+    assert!(workflow.contains("run: scripts/smoke-runtime-image.sh nano-llm:smoke"));
+    assert!(!workflow.contains("filesystem_container="));
+    assert!(taskfile.contains("scripts/smoke-runtime-image.sh nano-llm:smoke"));
+    assert!(smoke.contains("docker image inspect"));
+    assert!(smoke.contains("docker export"));
+    assert!(smoke.contains("/health"));
+}
+
+#[test]
+fn release_ci_uses_pinned_tools_and_tracks_its_local_inputs() {
+    let workflow = repository_file(".github/workflows/release-artifacts.yml");
+    let toolchain = repository_file("rust-toolchain.toml");
+    let dockerfile = repository_file("Dockerfile");
+
+    assert_eq!(workflow.matches("runs-on: ubuntu-24.04").count(), 3);
+    assert!(workflow.contains("toolchain: 1.94.0"));
+    assert!(toolchain.contains("channel = \"1.94.0\""));
+    assert!(toolchain.contains("components = [\"rustfmt\", \"clippy\"]"));
+    assert!(dockerfile.contains("ARG RUST_VERSION=1.94.0"));
+    for path in [
+        "Taskfile.yml",
+        "rust-toolchain.toml",
+        "scripts/smoke-release-artifact.sh",
+        "scripts/smoke-runtime-image.sh",
+        "tests/**",
+    ] {
+        assert!(
+            workflow.contains(&format!("      - {path}")),
+            "release workflow does not track {path}"
+        );
+    }
+}
+
+#[test]
 fn release_smoke_exercises_the_public_gateway_surface_and_canary_scan() {
     let smoke = repository_file("scripts/smoke-release-artifact.sh");
     assert!(smoke.contains("/health"));
     assert!(smoke.contains("/v1/models"));
     assert!(smoke.contains("/v1/chat/completions"));
     assert!(smoke.contains("data: [DONE]"));
+    assert!(smoke.contains("\"finish_reason\":\"stop\""));
     assert!(smoke.contains("release-master-canary"));
     assert!(smoke.contains("request-body-canary"));
     assert!(smoke.contains("qemu-aarch64"));
     assert!(smoke.contains("qemu-x86_64"));
+    assert!(smoke.contains("runner_label=binfmt"));
 }
 
 #[test]

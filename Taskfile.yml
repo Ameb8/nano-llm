@@ -37,6 +37,13 @@ tasks:
     cmds:
       - cargo test --features executable-test-tls --test executable_matrix_tests -- --test-threads=1
 
+  ci-release:
+    desc: Reproduce every release-artifacts CI job locally
+    cmds:
+      - task: executable-matrix
+      - task: release-linux
+      - task: scratch-runtime
+
   check:
     desc: Canonical quality check (format verification, linting, and tests)
     cmds:
@@ -58,3 +65,9 @@ tasks:
     desc: Build the minimal scratch runtime image for the host architecture
     cmds:
       - docker build --tag nano-llm:local .
+
+  scratch-runtime:
+    desc: Build and smoke-test the scratch runtime image
+    cmds:
+      - docker build --tag nano-llm:smoke .
+      - scripts/smoke-runtime-image.sh nano-llm:smoke
